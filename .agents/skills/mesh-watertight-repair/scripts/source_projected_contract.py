@@ -344,6 +344,28 @@ def build_projection_gates(
             "one or more closed components are inward-oriented",
         ),
     })
+    preservation = projection_report.get("source_preservation", {})
+    if preservation.get("preserved_faces", 0):
+        preserved = preservation.get("geometry_unchanged") is True
+        gates["retained_source_geometry_unchanged"] = gate(
+            preserved, preservation, "retained source coordinates and connectivity unchanged",
+            "a retained source shell was modified")
+        gates["retained_shell_assembly_orientation"] = gate(
+            preservation.get("assembled_material_orientation") is True,
+            preservation.get("assembled_material_orientation"),
+            "retained and rebuilt shells have consistent material nesting",
+            "combined shell orientation or nesting was not verified")
+        if preservation.get("all_faces_preserved"):
+            identity = (preserved and preservation.get("whole_source_valid") is True
+                        and preservation.get("preserved_faces") == candidate_metrics.get("triangles"))
+            gates["retained_source_geometry_unchanged"] = gate(
+                identity, preservation, "all certified source faces retained unchanged",
+                "source identity was not established")
+            gates["sealed_exterior_erosion_core_preserved"] = {
+                "required": False, "passed": identity, "status": "not_applicable_to_retained_source",
+                "value": preservation, "threshold": "certified source identity; no voxel reconstruction",
+                "failure_reason": None if identity else "source identity was not established",
+            }
     return gates
 
 
@@ -388,6 +410,12 @@ def sealed_exterior_occupancy(
     volume.  This is an absolute, resolution-derived lower bound; it is not a
     percentage comparison with proxy volume.
     """
+    preservation = projection_report.get("source_preservation", {})
+    if preservation.get("all_faces_preserved"):
+        return {"status": "not_applicable_to_retained_source", "passed": None,
+                "method": "no_voxel_reconstruction; source identity checked separately"}
+    if preservation.get("preserved_faces", 0):
+        candidate_metrics = projection_report.get("reconstructed_region_metrics") or {}
     construction = projection_report.get("sealed_exterior_construction") or {}
     core = construction.get("projection_erosion_core") or {}
     thresholds = projection_report.get("thresholds") or {}
@@ -586,6 +614,8 @@ def projection_unhandled_items(comparisons: dict[str, Any]) -> list[dict[str, An
         "sealed_exterior_occupancy",
     ):
         metric = comparisons.get(name, {})
+        if name == "sealed_exterior_occupancy" and metric.get("status") == "not_applicable_to_retained_source":
+            continue
         if metric.get("status") != "computed":
             rows.append({
                 "item": name,

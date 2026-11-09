@@ -19,6 +19,7 @@ from source_projected_contract import (  # noqa: E402
     projection_comparisons,
     volume_drift,
     watertight_shell_policy,
+    sealed_exterior_occupancy,
 )
 from source_projected_validation import (  # noqa: E402
     chunked_self_intersection_report,
@@ -106,6 +107,36 @@ def projection_report(vertex_count: int, self_intersection: dict | None = None) 
 
 
 class SourceProjectedContractTest(unittest.TestCase):
+    def test_source_identity_requires_preservation_and_assembly_checks(self):
+        points, faces = tetrahedron()
+        metrics = mesh_report(points, faces)
+        for invalid in (None, "geometry_unchanged", "whole_source_valid", "assembled_material_orientation"):
+            with self.subTest(invalid=invalid):
+                report = projection_report(len(points))
+                report.pop("sealed_exterior_construction")
+                report["source_preservation"] = {"preserved_faces": len(faces), "all_faces_preserved": True,
+                    "geometry_unchanged": True, "whole_source_valid": True, "assembled_material_orientation": True}
+                if invalid:
+                    report["source_preservation"][invalid] = False
+                comparisons = projection_comparisons(metrics, metrics, metrics, report,
+                    {"summary": {"changed_ratio_max": 0., "overlap_ratio_min": 1.}},
+                    {"status": "computed", "passed": True})
+                gates = build_projection_gates(metrics, comparisons, [], "projected.vtp", True, "proxy.vtp",
+                                               report, watertight_shell_policy("watertight-exterior-shell"))
+                decision = build_decision(gates, "projected.vtp")
+                self.assertEqual(decision["status"], "accepted" if invalid is None else "rejected")
+
+    def test_large_retained_shell_cannot_hide_collapsed_reconstructed_region(self):
+        big, faces = tetrahedron(10.)
+        small, _ = tetrahedron(.01)
+        combined = mesh_report(np.vstack((big, small + [30., 0., 0.])), np.vstack((faces, faces + 4)))
+        rebuilt = mesh_report(small, faces)
+        report = projection_report(8)
+        self.assertTrue(sealed_exterior_occupancy(combined, report)["passed"])
+        report["source_preservation"] = {"preserved_faces": 4, "all_faces_preserved": False}
+        report["reconstructed_region_metrics"] = rebuilt
+        self.assertFalse(sealed_exterior_occupancy(combined, report)["passed"])
+
     def test_projected_candidate_is_the_only_accepted_path(self) -> None:
         points, faces = tetrahedron()
         metrics = mesh_report(points, faces)

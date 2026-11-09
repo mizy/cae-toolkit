@@ -270,7 +270,7 @@ class BoundaryClassificationTest(unittest.TestCase):
         self.assertTrue(
             all(row["detector_reason"] == "loop_diameter_spans_component_bbox" for row in classified)
         )
-        self.assertTrue(all(not row["requires_policy"] for row in classified))
+        self.assertTrue(all(row["requires_policy"] for row in classified))
 
     def test_compact_interior_loop_remains_large_semantic_opening_in_assembly(self) -> None:
         points, faces = ring_with_triangle_components((0.5, 0.5))
@@ -321,7 +321,7 @@ class BoundaryClassificationTest(unittest.TestCase):
         self.assertEqual(len(inner), 1)
         self.assertEqual(inner[0]["classification"], "part_perimeter_or_opening_unknown")
         self.assertEqual(inner[0]["detector_reason"], "long_narrow_or_low_compactness_boundary")
-        self.assertFalse(inner[0]["requires_policy"])
+        self.assertTrue(inner[0]["requires_policy"])
 
     def test_many_boundaries_on_one_component_are_policy_conservative_and_configurable(self) -> None:
         points, faces = separated_square_patches(5)

@@ -8,8 +8,12 @@ import pyvista as pv
 from PIL import Image
 
 
-def read_surface(path: Path) -> pv.PolyData:
-    mesh = pv.read(path)
+def read_surface(path: Path, *, clean: bool = True) -> pv.PolyData:
+    if path.suffix.lower() in (".glb", ".gltf"):
+        from gltf_surface import read_gltf_surface
+        mesh = read_gltf_surface(path)
+    else:
+        mesh = pv.read(path)
     if isinstance(mesh, pv.MultiBlock):
         mesh = mesh.combine()
     if not isinstance(mesh, pv.PolyData):
@@ -18,10 +22,37 @@ def read_surface(path: Path) -> pv.PolyData:
         surface = mesh.extract_surface(algorithm="dataset_surface")
     except TypeError:
         surface = mesh.extract_surface()
-    surface = surface.triangulate().clean()
+    surface = surface.triangulate()
+    if clean:
+        if "Normals" in surface.point_data and "corner_normals" not in surface.cell_data:
+            faces = triangle_faces(surface)
+            offset = surface.n_verts + surface.n_lines
+            corners = np.zeros((surface.n_cells, 9), dtype=surface.point_data["Normals"].dtype)
+            corners[offset:offset + len(faces)] = np.asarray(surface.point_data["Normals"])[faces].reshape(-1, 9)
+            surface.cell_data["corner_normals"] = corners
+        surface = surface.clean()
     if surface.n_points == 0 or surface.n_cells == 0:
         raise ValueError(f"empty mesh after surface extraction: {path}")
     return surface
+
+
+def same_oriented_geometry(left: pv.PolyData, right: pv.PolyData) -> bool:
+    """Compare coordinates and oriented triangles independently of array order."""
+    if left.n_points != right.n_points or left.n_cells != right.n_cells:
+        return False
+    canonical = []
+    for mesh in (left, right):
+        points = np.asarray(mesh.points)
+        point_order = np.lexsort((points[:, 2], points[:, 1], points[:, 0]))
+        rank = np.empty(len(points), dtype=np.int64)
+        rank[point_order] = np.arange(len(points))
+        faces = rank[triangle_faces(mesh)]
+        rotations = (faces.argmin(axis=1)[:, None] + np.arange(3)) % 3
+        faces = np.take_along_axis(faces, rotations, axis=1)
+        face_order = np.lexsort((faces[:, 2], faces[:, 1], faces[:, 0]))
+        canonical.append((points[point_order], faces[face_order]))
+    return bool(np.array_equal(canonical[0][0], canonical[1][0])
+                and np.array_equal(canonical[0][1], canonical[1][1]))
 
 
 def triangle_faces(mesh: pv.PolyData) -> np.ndarray:
@@ -50,6 +81,8 @@ def write_vtp(
         mesh.point_data[name] = values
     for name, values in (cell_data or {}).items():
         mesh.cell_data[name] = values
+    if "Normals" in (point_data or {}):
+        mesh.GetPointData().SetActiveNormals("Normals")
     mesh.save(path)
 
 

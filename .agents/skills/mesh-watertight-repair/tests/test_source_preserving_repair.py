@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -60,6 +61,13 @@ class SourcePreservingRepairTest(unittest.TestCase):
         self.assertEqual(repaired_sources.tolist(), [10])
         self.assertEqual(repaired_points.shape, (3, 3))
         self.assertEqual([row["status"] for row in passes], ["applied", "applied"])
+
+    def test_cleanup_reuses_previous_snapshot_without_changing_reports(self) -> None:
+        points, faces, source_ids = dirty_triangle_mesh()
+        with patch("source_preserving_repair.mesh_report", wraps=mesh_report) as measured:
+            _, _, _, passes = run_deterministic_repair(points, faces, source_ids)
+        self.assertEqual(measured.call_count, 3)
+        self.assertEqual(passes[0]["after"], passes[1]["before"])
 
     def test_non_manifold_vertex_is_a_required_gate(self) -> None:
         points, faces = tetrahedron()

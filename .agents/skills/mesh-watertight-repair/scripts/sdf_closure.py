@@ -249,6 +249,29 @@ def extract_zero_surface(
     return np.asarray(world, dtype=np.float64), np.asarray(faces, dtype=np.int64)
 
 
+def smooth_closure_scaffold(
+    points: np.ndarray, faces: np.ndarray, pitch: float, iterations: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Smooth the topology scaffold before projection, with at most half-pitch motion."""
+    if iterations <= 0:
+        raise ValueError("scaffold smoothing iterations must be positive")
+    packed = np.column_stack((np.full(len(faces), 3), faces)).ravel()
+    surface = pv.PolyData(points, packed)
+    smoothed = surface.smooth_taubin(
+        n_iter=iterations, pass_band=0.1, boundary_smoothing=False,
+        feature_smoothing=False, normalize_coordinates=True,
+    )
+    delta = np.asarray(smoothed.points) - points
+    maximum = float(np.linalg.norm(delta, axis=1).max())
+    blend = min(1.0, 0.5 * pitch / max(maximum, 1e-15))
+    return points + blend * delta, {
+        "method": "bounded_vtk_windowed_sinc_before_source_projection",
+        "iterations": iterations, "pass_band": 0.1, "blend": blend,
+        "max_displacement": maximum * blend, "displacement_limit": 0.5 * pitch,
+        "connectivity_changed": False,
+    }
+
+
 def _replace_narrow_band_magnitude(
     phi: np.ndarray,
     solid: np.ndarray,

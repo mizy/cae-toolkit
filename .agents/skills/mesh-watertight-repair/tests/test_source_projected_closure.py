@@ -14,7 +14,12 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from mesh_metrics import mesh_report  # noqa: E402
 from source_projected_closure import (  # noqa: E402
     ProjectionThresholds,
+    _barycentric,
+    _component_consistency_rejections,
+    _closest_source_points,
     project_closure_to_source,
+    interpolate_source_normals,
+    interpolate_source_corner_normals,
     rollback_reported_self_intersections,
 )
 
@@ -34,6 +39,93 @@ def packed_polydata(points: np.ndarray, faces: np.ndarray) -> pv.PolyData:
 
 
 class SourceProjectedClosureTest(unittest.TestCase):
+    def test_zero_edge_margins_allow_closest_point_edge_roundoff(self) -> None:
+        rng = np.random.default_rng(17)
+        roundoff_points = 0
+        for _ in range(12):
+            source, faces = tetrahedron()
+            rotation, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+            source = source @ rotation
+            proxy = source + rng.normal(size=3) * .03
+            closest, ids, _ = _closest_source_points(source, faces, proxy)
+            barycentric = _barycentric(closest, source[faces[ids]])
+            roundoff_points += int(np.count_nonzero(barycentric.min(axis=1) < 0))
+            _, _, _, report = project_closure_to_source(
+                proxy, faces, source, faces,
+                thresholds=ProjectionThresholds(
+                    max_projection_distance=1., min_signed_normal_dot=-1.,
+                    orientation_vote_min_margin=0., source_edge_barycentric_margin=0.,
+                    defect_edge_barycentric_margin=0., require_component_consistency=False,
+                ),
+            )
+            counts = report["projection"]["rejection_counts"]
+            self.assertEqual(counts["source_edge_or_vertex_gate_failed"], 0)
+            self.assertEqual(counts["source_defect_edge_gate_failed"], 0)
+        self.assertGreater(roundoff_points, 0)
+
+    def test_corner_normals_keep_native_seams_on_shared_physical_vertices(self) -> None:
+        points = np.asarray([[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.]])
+        faces = np.asarray([[0, 1, 2], [0, 2, 3]])
+        source = points[faces].reshape(-1, 3)
+        source_faces = np.asarray([[0, 1, 2], [3, 4, 5]])
+        normals = np.asarray([[0., 0., 1.]] * 3 + [[0., 1., 0.]] * 3)
+        original = points.copy()
+        result = interpolate_source_corner_normals(points, faces, source, source_faces, normals, np.asarray([0, 1]))
+        np.testing.assert_array_equal(result.reshape(-1, 3), normals)
+        np.testing.assert_array_equal(points, original)
+        self.assertEqual(points.shape[0], 4)
+        reversed_faces = faces[:, ::-1]
+        reverse = interpolate_source_corner_normals(points, reversed_faces, source, source_faces, normals, np.asarray([0, 1]))
+        np.testing.assert_array_equal(reverse.reshape(-1, 3), -normals)
+
+    def test_unmerged_projection_target_keeps_native_normal_discontinuities(self) -> None:
+        import tempfile
+        from mesh_io import read_surface
+
+        source = pv.Cube().triangulate()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "native.vtp"
+            source.save(path)
+            target = read_surface(path, clean=False)
+        np.testing.assert_array_equal(target.points, source.points)
+        np.testing.assert_array_equal(target.point_data["Normals"], source.point_data["Normals"])
+
+    def test_source_normal_interpolation_keeps_geometry_and_generated_normals(self) -> None:
+        source, source_faces = tetrahedron()
+        weights = np.asarray([[0.6, 0.2, 0.2], [0.2, 0.6, 0.2], [0.2, 0.2, 0.6]])
+        points = weights @ source[source_faces[0]]
+        original = points.copy()
+        faces = np.asarray([[0, 1, 2]])
+        native_normals = packed_polydata(source, source_faces).compute_normals(
+            cell_normals=False, split_vertices=False,
+        ).point_data["Normals"]
+        provenance = {"point_data": {
+            "source_projection_applied": np.asarray([1, 1, 0]),
+            "nearest_source_face_id": np.zeros(3, dtype=int),
+        }}
+        normals = interpolate_source_normals(points, faces, source, source_faces, provenance)
+        expected = weights[:2] @ native_normals[source_faces[0]]
+        expected /= np.linalg.norm(expected, axis=1)[:, None]
+        np.testing.assert_allclose(normals[:2], expected, atol=1e-6)
+        generated = packed_polydata(points, faces).compute_normals(
+            cell_normals=False, split_vertices=False,
+        ).point_data["Normals"]
+        np.testing.assert_array_equal(normals[2], generated[2])
+        np.testing.assert_array_equal(points, original)
+
+    def test_fixed_vertices_are_excluded_from_projection(self) -> None:
+        proxy_points, faces = tetrahedron()
+        source_points, source_faces = tetrahedron(2.0)
+        movable = np.asarray([False, True, True, True])
+        points, _, provenance, _ = project_closure_to_source(
+            proxy_points, faces, source_points, source_faces,
+            thresholds=ProjectionThresholds(max_projection_distance=4.0), movable_vertex_mask=movable,
+        )
+        np.testing.assert_array_equal(points[0], proxy_points[0])
+        self.assertEqual(provenance['point_data']['source_projection_applied'][0], 0)
+        with self.assertRaisesRegex(ValueError, 'movable_vertex_mask'):
+            project_closure_to_source(proxy_points, faces, source_points, source_faces, movable_vertex_mask=np.ones(2))
+
     def test_exact_projection_preserves_watertight_proxy_connectivity(self) -> None:
         proxy_points, proxy_faces = tetrahedron(1.0)
         source_points, source_faces = tetrahedron(2.0)
@@ -81,6 +173,20 @@ class SourceProjectedClosureTest(unittest.TestCase):
         self.assertTrue(np.all(provenance["point_data"]["source_projection_fallback"]))
         self.assertEqual(report["projection"]["unclassified"], 0)
         self.assertGreater(report["projection"]["rejection_counts"]["distance_gate_failed"], 0)
+
+    def test_nearer_unreliable_layer_does_not_hide_the_trusted_skin(self) -> None:
+        skin = np.asarray([[-10., -10., 0.], [10., -10., 0.], [0., 10., 0.]])
+        source = np.vstack((skin, skin + [0., 0., 0.1]))
+        proxy = np.asarray([[-0.2, 0., 0.08], [0.2, 0., 0.08], [0., 0.2, 0.08]])
+        points, _, provenance, report = project_closure_to_source(
+            proxy, np.asarray([[0, 1, 2]]), source, np.asarray([[0, 1, 2], [3, 4, 5]]),
+            thresholds=ProjectionThresholds(max_projection_distance=0.2),
+            reliable_source_face_mask=np.asarray([True, False]),
+        )
+        np.testing.assert_allclose(points[:, 2], 0., atol=1e-15)
+        np.testing.assert_array_equal(provenance["point_data"]["nearest_source_face_id"], [0, 0, 0])
+        self.assertEqual(report["projection"]["source_projected"], 3)
+        self.assertEqual(report["source_query"]["eligible_source_faces"], 1)
 
     def test_explicit_source_face_reliability_mask_is_blocking(self) -> None:
         proxy_points, proxy_faces = tetrahedron(1.0)
@@ -264,6 +370,40 @@ class SourceProjectedClosureTest(unittest.TestCase):
 
         self.assertEqual(report["component_gate"]["inconsistent_proxy_faces"], 1)
         self.assertGreater(report["projection"]["rejection_counts"]["source_component_spatial_mismatch"], 0)
+
+    def test_continuity_gate_allows_coplanar_panels_across_a_small_seam(self) -> None:
+        proxy = np.asarray([[-0.3, 0.2, 0.1], [0.3, 0.2, 0.1], [0.3, 0.7, 0.1]])
+        faces = np.asarray([[0, 1, 2]])
+        source = np.asarray([
+            [-1., 0., 0.], [-0.01, 0., 0.], [-0.01, 1., 0.], [-1., 1., 0.],
+            [0.01, 0., 0.], [1., 0., 0.], [1., 1., 0.], [0.01, 1., 0.],
+        ])
+        source_faces = np.asarray([[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7]])
+        for ratio, expected in ((None, 0), (0.25, 3)):
+            _, _, _, report = project_closure_to_source(
+                proxy, faces, source, source_faces,
+                thresholds=ProjectionThresholds(
+                    max_projection_distance=0.2, source_edge_barycentric_margin=0.,
+                    defect_edge_barycentric_margin=0., cross_component_jump_ratio=ratio,
+                ),
+            )
+            self.assertEqual(report["projection"]["source_projected"], expected)
+
+    def test_continuity_gate_rejects_a_jump_between_parallel_layers(self) -> None:
+        proxy = np.asarray([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]])
+        closest = proxy + [0., 0., 0.1]
+        closest[1, 2] += 0.6
+        rejected, count = _component_consistency_rejections(
+            proxy, np.asarray([[0, 1, 2]]), closest,
+            np.asarray([0, 1, 0]), np.ones(3, dtype=bool), 0.25,
+        )
+        self.assertEqual(count, 1)
+        np.testing.assert_array_equal(rejected, [True, True, True])
+        with self.assertRaisesRegex(ValueError, "cross_component_jump_ratio"):
+            _component_consistency_rejections(
+                proxy, np.asarray([[0, 1, 2]]), closest,
+                np.asarray([0, 1, 0]), np.ones(3, dtype=bool), float("nan"),
+            )
 
     def test_triangle_collapse_rolls_projection_back_to_proxy(self) -> None:
         proxy_points, proxy_faces = tetrahedron(1.0)

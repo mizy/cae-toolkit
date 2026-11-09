@@ -11,6 +11,22 @@ import numpy as np
 MAX_RASTER_CANDIDATES_PER_CHUNK = 4_000_000
 DEFAULT_FACE_CHUNK = 12_000
 DEPTH_EVALUATION_CHUNK = 250_000
+ORTHOGRAPHIC_FRAMES = (
+    ((1., 0., 0.), (0., 1., 0.)), ((-1., 0., 0.), (0., 1., 0.)),
+    ((0., 0., 1.), (0., 1., 0.)), ((0., 0., -1.), (0., 1., 0.)),
+    ((0., 1., 0.), (0., 0., -1.)), ((0., -1., 0.), (0., 0., 1.)),
+    ((1., .4, 1.), (0., 1., 0.)), ((-1., .4, -1.), (0., 1., 0.)),
+)
+
+
+def projection_frame(points: np.ndarray, eye: tuple, up: tuple) -> tuple[np.ndarray, np.ndarray]:
+    forward = -np.asarray(eye, dtype=float)
+    forward /= np.linalg.norm(forward)
+    right = np.cross(forward, up)
+    right /= np.linalg.norm(right)
+    upward = np.cross(right, forward)
+    basis = np.column_stack((right, upward, forward))
+    return points @ basis, basis
 
 
 @dataclass(frozen=True)
@@ -120,19 +136,22 @@ def rasterize_solid_view(
     grid_size: int,
     depth_tolerance: float,
     collect_face_evidence: bool = True,
+    projection_bounds: np.ndarray | None = None,
+    sample_centers: bool = False,
 ) -> SolidViewRaster:
     if grid_size < 2:
         raise ValueError("grid_size must be at least 2")
     if depth_tolerance < 0.0:
         raise ValueError("depth_tolerance must be non-negative")
     coordinates, triangles = _validate_mesh(points, faces)
-    rows, cols, projected = _project_points(coordinates, view, grid_size)
+    rows, cols, projected = _project_points(coordinates, view, grid_size, projection_bounds)
     projected_triangles = projected[triangles]
     vertex_depth = coordinates @ np.asarray(view.depth_vector, dtype=np.float64)
     triangle_depth = vertex_depth[triangles]
     depth_buffer = np.full(rows * cols, np.inf, dtype=np.float64)
     first_pass_stats = _RasterStats()
-    for face_ids, pixels, sample_depth in _solid_triangle_samples(
+    sampler = triangle_center_samples if sample_centers else _solid_triangle_samples
+    for face_ids, pixels, sample_depth in sampler(
         projected_triangles, triangle_depth, rows, cols, first_pass_stats
     ):
         np.minimum.at(depth_buffer, pixels, sample_depth)
@@ -147,7 +166,7 @@ def rasterize_solid_view(
     first_hit_face = np.full(rows * cols, face_count, dtype=np.int64)
     second_pass_stats = _RasterStats()
     if collect_face_evidence:
-        for face_ids, pixels, sample_depth in _solid_triangle_samples(
+        for face_ids, pixels, sample_depth in sampler(
             projected_triangles, triangle_depth, rows, cols, second_pass_stats
         ):
             gap = np.maximum(0.0, sample_depth - depth_buffer[pixels])
@@ -173,7 +192,7 @@ def rasterize_solid_view(
         face_min_depth_gap=min_depth_gap,
         report={
             "view": view.name,
-            "method": "conservative_triangle_pixel_cell_min_depth_z_buffer",
+            "method": "pixel_center_triangle_z_buffer" if sample_centers else "conservative_triangle_pixel_cell_min_depth_z_buffer",
             "grid": {"rows": rows, "cols": cols},
             "pixels": int(rows * cols),
             "occupied_pixels": occupied_pixels,
@@ -194,8 +213,8 @@ def rasterize_solid_view(
             ),
             "candidate_limit_per_chunk": MAX_RASTER_CANDIDATES_PER_CHUNK,
             "depth_tolerance": float(depth_tolerance),
-            "subpixel_policy": "conservative_pixel_cell_intersection",
-            "depth_policy": "linear_minimum_on_triangle_pixel_cell_intersection",
+            "subpixel_policy": "pixel_center_only" if sample_centers else "conservative_pixel_cell_intersection",
+            "depth_policy": "linear_at_pixel_center" if sample_centers else "linear_minimum_on_triangle_pixel_cell_intersection",
         },
     )
 
@@ -206,6 +225,90 @@ class _RasterStats:
     solid_samples: int = 0
     chunks: int = 0
     max_candidate_samples: int = 0
+
+
+def triangle_center_samples(
+    projected_triangles: np.ndarray,
+    triangle_depth: np.ndarray,
+    rows: int,
+    cols: int,
+    stats: _RasterStats | None = None,
+):
+    """Yield orthographic ray/triangle hits at pixel centers in bounded-memory chunks."""
+    face_count = projected_triangles.shape[0]
+    start = 0
+    while start < face_count:
+        end = min(face_count, start + DEFAULT_FACE_CHUNK)
+        while True:
+            triangles = projected_triangles[start:end]
+            lower, widths, _heights, counts = _raster_bounds(triangles, rows, cols)
+            candidate_count = int(np.sum(counts, dtype=np.int64))
+            if candidate_count <= MAX_RASTER_CANDIDATES_PER_CHUNK or end - start <= 1:
+                break
+            end = start + max(1, (end - start) // 2)
+
+        if stats is not None:
+            stats.candidate_samples += candidate_count
+            stats.chunks += 1
+            stats.max_candidate_samples = max(stats.max_candidate_samples, candidate_count)
+        local_faces = np.repeat(np.arange(end - start, dtype=np.int64), counts)
+        if local_faces.size == 0:
+            start = end
+            continue
+        begins = np.cumsum(counts, dtype=np.int64) - counts
+        offsets = np.arange(local_faces.size, dtype=np.int64) - np.repeat(begins, counts)
+        repeated_widths = widths[local_faces]
+        col = lower[local_faces, 0] + offsets % repeated_widths
+        row = lower[local_faces, 1] + offsets // repeated_widths
+
+        triangles = projected_triangles[start:end]
+        a = triangles[local_faces, 0]
+        b = triangles[local_faces, 1]
+        c = triangles[local_faces, 2]
+        sample_x = col.astype(np.float64)
+        sample_y = row.astype(np.float64)
+        denominator = (
+            (b[:, 1] - c[:, 1]) * (a[:, 0] - c[:, 0])
+            + (c[:, 0] - b[:, 0]) * (a[:, 1] - c[:, 1])
+        )
+        denominator_epsilon = np.finfo(np.float64).eps * max(rows, cols) ** 2 * 16.0
+        valid = np.abs(denominator) > denominator_epsilon
+        weight_a = np.zeros_like(denominator)
+        weight_b = np.zeros_like(denominator)
+        weight_a[valid] = (
+            (b[valid, 1] - c[valid, 1]) * (sample_x[valid] - c[valid, 0])
+            + (c[valid, 0] - b[valid, 0]) * (sample_y[valid] - c[valid, 1])
+        ) / denominator[valid]
+        weight_b[valid] = (
+            (c[valid, 1] - a[valid, 1]) * (sample_x[valid] - c[valid, 0])
+            + (a[valid, 0] - c[valid, 0]) * (sample_y[valid] - c[valid, 1])
+        ) / denominator[valid]
+        weight_c = 1.0 - weight_a - weight_b
+        barycentric_epsilon = 1.0e-9
+        inside = (
+            valid
+            & (weight_a >= -barycentric_epsilon)
+            & (weight_b >= -barycentric_epsilon)
+            & (weight_c >= -barycentric_epsilon)
+        )
+        if np.any(inside):
+            if stats is not None:
+                stats.solid_samples += int(np.count_nonzero(inside))
+            selected_local = local_faces[inside]
+            depths = triangle_depth[start:end]
+            sample_depth = (
+                weight_a[inside] * depths[selected_local, 0]
+                + weight_b[inside] * depths[selected_local, 1]
+                + weight_c[inside] * depths[selected_local, 2]
+            )
+            yield (
+                start + selected_local,
+                row[inside] * cols + col[inside],
+                sample_depth,
+            )
+        start = end
+
+
 
 
 def _solid_triangle_samples(
@@ -453,10 +556,17 @@ def _project_points(
     points: np.ndarray,
     view: ViewSpec,
     grid_size: int,
+    projection_bounds: np.ndarray | None = None,
 ) -> tuple[int, int, np.ndarray]:
     projected = points[:, view.project_axes]
-    mins = np.min(projected, axis=0)
-    spans = np.ptp(projected, axis=0)
+    if projection_bounds is None:
+        mins = np.min(projected, axis=0)
+        spans = np.ptp(projected, axis=0)
+    else:
+        bounds = np.asarray(projection_bounds, dtype=float)
+        if bounds.shape != (2, 2) or not np.isfinite(bounds).all() or np.any(bounds[1] <= bounds[0]):
+            raise ValueError("projection_bounds must contain finite 2-D minima and greater maxima")
+        mins, spans = bounds[0], bounds[1] - bounds[0]
     longest = float(np.max(spans))
     if not np.isfinite(longest) or longest <= 0.0:
         raise ValueError("cannot rasterize a zero-size projection")

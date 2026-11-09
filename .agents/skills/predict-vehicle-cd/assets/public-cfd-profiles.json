@@ -1,0 +1,122 @@
+{
+  "ahmedml": {
+    "repo": "neashton/ahmedml",
+    "revision": "02688c727cdb8dc8678e28abc6bbbb7e93c5fa15",
+    "mesh_name": "ahmed",
+    "family_id": "ahmed-base",
+    "front_axis": "-x",
+    "up_axis": "+z",
+    "ground_clearance_m": 0.05,
+    "yaw_deg": 0.0,
+    "speed_m_s": 1.0,
+    "kinematic_viscosity_m2_s": 3.75e-07,
+    "conditions": {
+      "ground": {
+        "value": "stationary no-slip floor; no moving-ground condition",
+        "assumed": false
+      },
+      "wheels": {
+        "value": "not applicable; Ahmed body has no wheels",
+        "assumed": false
+      },
+      "turbulence": {
+        "value": "Spalart-Allmaras delayed detached-eddy simulation (SA-DDES)",
+        "assumed": false
+      },
+      "solver": {
+        "value": "OpenFOAM v2212 pimpleFoam, transient incompressible flow",
+        "assumed": false
+      },
+      "averaging": {
+        "value": "time-averaged CFD labels",
+        "status": "published-window conflict",
+        "details": "Paper v1 says 40 CTU total with averaging after 10 CTU; pinned dataset README says approximately 80 CTU. Exact per-run window is unresolved.",
+        "assumed": false
+      },
+      "reference_area": {
+        "value": "geometry-specific frontal area from force_mom_varref_all.csv",
+        "assumed": false
+      },
+      "force_axes": {
+        "value": "published Cd=Fx and Cl=Fz coefficient definitions; labels copied without sign changes",
+        "assumed": false
+      }
+    },
+    "label_file": "force_mom_varref_all.csv",
+    "provenance": {
+      "description": "AhmedML high-fidelity CFD geometry variants; published labels are simulation outputs, not experimental truth.",
+      "license": "CC-BY-SA-4.0",
+      "paper_url": "https://arxiv.org/abs/2407.20801",
+      "source_setup": "OpenFOAM v2212, pimpleFoam, SA-DDES; the pinned dataset README describes approximately 80 CTU, while paper v1 describes 40 CTU total with averaging after 10 CTU.",
+      "reynolds_definition": "U_infinity * full STL body length / nu; U=1 m/s and nu=3.75e-7 m^2/s from the paper.",
+      "geometry_orientation": "Raw STL X is body length with the rounded nose at negative X; raw Z is up and raw Y is lateral, confirmed from the official coordinate bounds and body profile.",
+      "geometry_clearance": "The paper states 50 mm clearance above the floor; source STL vertical coordinates are normalized to that documented floor distance during rendering.",
+      "yaw_representation": "AhmedML uses zero yaw; the source geometry is rendered in its documented body frame.",
+      "condition_limitations": [
+        "The published paper and pinned README disagree on total averaging duration.",
+        "The surface mesh is the simplified Ahmed body; it has no wheels or experimental stilts."
+      ]
+    }
+  },
+  "windsorml": {
+    "repo": "neashton/windsorml",
+    "revision": "8a6ca32ae22c94f54df2186d1b0ccf9662a294c2",
+    "mesh_name": "windsor",
+    "family_id": "windsor-base",
+    "front_axis": "-x",
+    "up_axis": "+y",
+    "yaw_deg": 2.5,
+    "speed_m_s": 40.0,
+    "reference_body_length_m": 1.044,
+    "reference_reynolds": 2900000.0,
+    "conditions": {
+      "ground": {
+        "value": "stationary no-slip ground plane; a ground boundary layer grows; per-run body clearance is a published geometry parameter",
+        "assumed": false
+      },
+      "wheels": {
+        "value": "no wheels in the dataset baseline geometry",
+        "assumed": false
+      },
+      "turbulence": {
+        "value": "wall-modeled LES with Vreman subgrid model and equilibrium wall model",
+        "assumed": false
+      },
+      "solver": {
+        "value": "Volcano ScaLES, transient compressible Navier-Stokes with explicit SSP Runge-Kutta 3 integration",
+        "version": "not stated in paper",
+        "assumed": false
+      },
+      "averaging": {
+        "value": "time-averaged CFD labels",
+        "status": "window not published",
+        "details": "The paper says outputs are time averaged but does not report the averaging start or duration for the dataset.",
+        "assumed": false
+      },
+      "reference_area": {
+        "value": "geometry-specific frontal area from force_mom_varref_all.csv",
+        "assumed": false
+      },
+      "force_axes": {
+        "value": "published yawed-model-axis coefficients Cd=Fx, Cl=Fy, Cs=Fz with y up; these are not freestream-projected components at nonzero yaw and labels are copied unchanged",
+        "assumed": false
+      }
+    },
+    "label_file": "force_mom_varref_all.csv",
+    "provenance": {
+      "description": "WindsorML wall-modeled LES geometry variants; published labels are simulation outputs, not experimental truth.",
+      "license": "CC-BY-SA-4.0",
+      "paper_url": "https://arxiv.org/abs/2407.19320",
+      "source_setup": "Volcano ScaLES transient compressible Navier-Stokes WMLES; nominal inlet speed 40 m/s, Reynolds number 2.9e6 based on full body length, and published body rotation -2.5 degrees about raw +Y.",
+      "reynolds_definition": "U_infinity * full STL body length / nu; nu is derived from the paper's U=40 m/s, Re=2.9e6 and baseline full-body length 1.044 m.",
+      "geometry_orientation": "Raw X is the longitudinal axis with front at negative X; raw Y is up and raw Z is lateral. The floor-referenced STL includes the four support stilts that reach Y=0.",
+      "geometry_clearance": "The published clearance design parameter varies from 10 to 200 mm and is retained in each design_value row. The full STL already places support feet at the floor and the body underside at its reported clearance; no clearance offset is added during rendering.",
+      "yaw_representation": "The paper rotates the body by -2.5 degrees about raw +Y while the tunnel flow is along raw +X. In the fixed body frame the inverse-rotated freestream points toward canonical +Y, so yaw_deg is +2.5 degrees; the published body rotation is -2.5 degrees.",
+      "condition_limitations": [
+        "The paper does not state the time-averaging start or duration for the dataset labels.",
+        "The source STL includes floor-reaching support stilts; its per-run body clearance is already present in the mesh.",
+        "Published Cd, Cl and Cs are source-axis force components, not freestream-projected coefficients."
+      ]
+    }
+  }
+}

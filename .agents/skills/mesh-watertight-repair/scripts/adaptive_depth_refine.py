@@ -339,6 +339,20 @@ def split_face(
         "ca": midpoint_index.get(edge_key(c, a)),
     }
     raw = split_face_raw(a, b, c, mids)
+    if sum(value is not None for value in mids.values()) == 2:
+        ab, bc, ca = mids["ab"], mids["bc"], mids["ca"]
+        if ca is None:
+            alternate = [raw[0], [a, ab, bc], [a, bc, c]]
+        elif ab is None:
+            alternate = [raw[0], [b, bc, ca], [b, ca, a]]
+        else:
+            alternate = [raw[0], [c, ca, ab], [c, ab, b]]
+        candidates = np.asarray([raw, alternate], dtype=np.int64)
+        triangles = points[candidates]
+        lengths_squared = np.sum((triangles - np.roll(triangles, -1, axis=2)) ** 2, axis=3)
+        double_area = np.linalg.norm(np.cross(triangles[:, :, 1] - triangles[:, :, 0], triangles[:, :, 2] - triangles[:, :, 0]), axis=2)
+        aspect = np.divide(lengths_squared.max(axis=2), double_area, out=np.full_like(double_area, np.inf), where=double_area > 0)
+        raw = candidates[int(np.argmin(aspect.max(axis=1)))].tolist()
     normal = np.cross(points[b] - points[a], points[c] - points[a])
     return [orient(child, points, normal) for child in raw]
 

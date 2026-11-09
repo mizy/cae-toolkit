@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -21,8 +22,8 @@ from repair_policy import build_policy_packet, load_policy_decisions, resolve_po
 from sealed_exterior_atlas import (
     build_sealed_exterior_atlas,
 )
-from sdf_closure import SdfClosureConfig, build_tsdf_closure
-from source_projected_closure import ProjectionThresholds, project_closure_to_source
+from sdf_closure import SdfClosureConfig, build_tsdf_closure, smooth_closure_scaffold
+from source_projected_closure import ProjectionThresholds, interpolate_source_normals, project_closure_to_source
 from source_projected_validation import (
     repair_closure_proxy_self_intersections,
     repair_projected_self_intersections,
@@ -39,7 +40,7 @@ from run_status import (
     topology_brief,
     update_run_status,
 )
-from two_stage_contract import build_report
+from two_stage_contract import build_report, record_cfd_refinement
 from two_stage_outputs import (
     extraction_report,
     outputs_report,
@@ -51,6 +52,7 @@ from two_stage_outputs import (
     write_visibility_labels,
 )
 from source_preserving_repair import prune_classified_internal_components, run_deterministic_repair
+from solid_triangle_raster import triangle_center_samples as triangle_raster_samples
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("input", type=Path, help="Input mesh: VTP, STL, OBJ, GLB, GLTF, or VTK.")
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--purpose", choices=("watertight", "cfd", "print"), default="watertight")
+    parser.add_argument("--surface-strategy", choices=("projected-shell", "source-material"), default="projected-shell")
+    parser.add_argument("--stitch-tolerance", type=float, default=0., help="Optional boundary seam tolerance in input units; zero disables approximate sewing")
+    parser.add_argument("--repair-timeout-seconds", type=float, help="Wall-clock limit for projected-shell, including native calls (default 120 seconds)")
+    parser.add_argument("--_projected-shell-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--source-max-error", type=float, help="Source-material geometric error budget, in input units")
+    parser.add_argument("--source-boundary-mode", choices=("review", "wall", "cap"), default="review")
+    parser.add_argument("--source-max-recovery-facets", type=int, help="Maximum source facets allowed in one recovery union (default 1000)")
+    parser.add_argument("--source-union-backend", choices=("cgal", "manifold", "local", "planar"), help="Source-material union backend; planar is limited to reviewed near-coplanar open sheets (default cgal)")
+    parser.add_argument("--source-assembly-context", type=Path, help="Unchanged assembly excluding the source part, in the same frame and units")
+    parser.add_argument("--source-timeout-seconds", type=float, help="Wall-clock limit for source-material, including native calls (default 120 seconds)")
+    parser.add_argument("--_source-material-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--certify-reverse-fidelity", action="store_true", help="Attempt a bounded source-to-candidate continuous surface check")
+    from print_mesh import add_print_arguments, validate_print_arguments
+    add_print_arguments(parser)
+    parser.add_argument("--cfd-max-edge-length", type=float, help="CFD surface edge limit in input coordinate units.")
+    parser.add_argument("--cfd-max-output-faces", type=int, default=2_000_000)
     parser.add_argument("--overwrite", action="store_true", help="Allow writing over files in an existing output directory.")
     parser.add_argument(
         "--group-source-gltf",
@@ -107,7 +126,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_REMOVE_NAME_REGEX,
         help="Case-insensitive GLTF group/geometry-name regex reported as a diagnostic removal candidate.",
     )
-    parser.add_argument("--visibility-grid", type=int, default=900)
+    parser.add_argument("--visibility-grid", type=int)
     parser.add_argument(
         "--depth-tolerance",
         type=float,
@@ -191,6 +210,18 @@ def parse_args() -> argparse.Namespace:
         help="Gaussian SDF smoothing sigma in voxels; bounded to at most half a pitch of near-zero field motion.",
     )
     parser.add_argument(
+        "--scaffold-smoothing-iterations", type=int, default=0,
+        help="Windowed-Sinc iterations before source projection; motion is bounded to half a pitch (0 disables).",
+    )
+    parser.add_argument(
+        "--projection-target", type=Path,
+        help="Optional AI-reviewed exterior surface in the input frame/units; supplies shape while the closure scaffold supplies topology.",
+    )
+    parser.add_argument(
+        "--cross-component-jump-ratio", type=float,
+        help="Allow source-panel seams only when displacement jumps stay below this fraction of scaffold edge length; default keeps strict component IDs.",
+    )
+    parser.add_argument(
         "--max-sdf-memory-gb",
         type=float,
         default=4.0,
@@ -272,7 +303,65 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--preview-size", type=int, default=900)
     parser.add_argument("--skip-previews", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.surface_strategy == "projected-shell" and args.purpose != "print":
+        if args.repair_timeout_seconds is None:
+            args.repair_timeout_seconds = 120.
+        if not np.isfinite(args.repair_timeout_seconds) or args.repair_timeout_seconds <= 0:
+            parser.error("--repair-timeout-seconds must be finite and positive")
+    elif args.repair_timeout_seconds is not None or args._projected_shell_worker:
+        parser.error("--repair-timeout-seconds applies to projected-shell watertight/CFD")
+    if not np.isfinite(args.stitch_tolerance) or args.stitch_tolerance < 0:
+        parser.error("--stitch-tolerance must be finite and nonnegative")
+    if args.stitch_tolerance and (args.surface_strategy != "projected-shell" or args.purpose == "print"):
+        parser.error("--stitch-tolerance applies to projected-shell watertight/CFD")
+    if args.visibility_grid is None:
+        args.visibility_grid = 128 if args.surface_strategy == "source-material" else 900
+    if args.surface_strategy == "source-material":
+        if args.purpose != "watertight":
+            parser.error("source-material supports geometric watertight material; use the purpose-specific CFD/print workflow for engineering validation")
+        if args.source_max_error is None or not np.isfinite(args.source_max_error) or args.source_max_error <= 0:
+            parser.error("source-material requires a positive finite --source-max-error in input units")
+        if args.visibility_grid < 32:
+            parser.error("source-material --visibility-grid must be at least 32")
+        if args.source_max_recovery_facets is None:
+            args.source_max_recovery_facets = 1000
+        if args.source_union_backend is None:
+            args.source_union_backend = "cgal"
+        if args.source_max_recovery_facets < 1:
+            parser.error("--source-max-recovery-facets must be positive")
+        if args.source_timeout_seconds is None:
+            args.source_timeout_seconds = 120.0
+        if not np.isfinite(args.source_timeout_seconds) or args.source_timeout_seconds <= 0:
+            parser.error("--source-timeout-seconds must be finite and positive")
+        if args.scaffold_smoothing_iterations or args.cross_component_jump_ratio is not None:
+            parser.error("scaffold smoothing and cross-component projection controls apply to projected-shell")
+        args.target_name = "watertight-material"
+    elif args.source_max_error is not None or args.source_boundary_mode != "review" or args.certify_reverse_fidelity or args.source_max_recovery_facets is not None or args.source_union_backend is not None or args.source_assembly_context is not None or args.source_timeout_seconds is not None or args._source_material_worker:
+        parser.error("source-material settings require --surface-strategy source-material")
+    if args.scaffold_smoothing_iterations < 0:
+        parser.error("--scaffold-smoothing-iterations must be nonnegative")
+    if args.cross_component_jump_ratio is not None and (
+        not np.isfinite(args.cross_component_jump_ratio) or args.cross_component_jump_ratio <= 0
+    ):
+        parser.error("--cross-component-jump-ratio must be finite and positive")
+    if args.purpose == "cfd" and (
+        args.cfd_max_edge_length is None or not np.isfinite(args.cfd_max_edge_length)
+        or args.cfd_max_edge_length <= 0 or args.cfd_max_output_faces <= 0
+    ):
+        parser.error("--purpose cfd requires a positive finite --cfd-max-edge-length and a positive face budget")
+    if args.purpose != "cfd" and args.cfd_max_edge_length is not None:
+        parser.error("--cfd-max-edge-length requires --purpose cfd")
+    if args.purpose == "print" and (args.scaffold_smoothing_iterations or args.cross_component_jump_ratio is not None or args.projection_target is not None):
+        parser.error("scaffold smoothing and component projection controls require --purpose watertight or cfd")
+    if args.purpose == "print":
+        try:
+            validate_print_arguments(args)
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif any(value.startswith("--print-") for value in sys.argv[1:]):
+        parser.error("--print-* settings require --purpose print")
+    return args
 
 
 def gltf_group_keep_mask(
@@ -415,81 +504,6 @@ def visible_faces_from_view(
             "face_score_contribution": "one point for any first-hit pixel support in this view",
         },
     }
-
-
-def triangle_raster_samples(
-    projected_triangles: np.ndarray,
-    triangle_depth: np.ndarray,
-    rows: int,
-    cols: int,
-):
-    """Yield orthographic ray/triangle hits at pixel centers in bounded-memory chunks."""
-    face_count = projected_triangles.shape[0]
-    start = 0
-    while start < face_count:
-        end = min(face_count, start + RASTER_FACE_CHUNK)
-        while True:
-            triangles = projected_triangles[start:end]
-            lower, _upper, widths, _heights, counts = raster_bounds(triangles, rows, cols)
-            candidate_count = int(np.sum(counts, dtype=np.int64))
-            if candidate_count <= MAX_RASTER_CANDIDATES_PER_CHUNK or end - start <= 1:
-                break
-            end = start + max(1, (end - start) // 2)
-
-        local_faces = np.repeat(np.arange(end - start, dtype=np.int64), counts)
-        if local_faces.size == 0:
-            start = end
-            continue
-        begins = np.cumsum(counts, dtype=np.int64) - counts
-        offsets = np.arange(local_faces.size, dtype=np.int64) - np.repeat(begins, counts)
-        repeated_widths = widths[local_faces]
-        col = lower[local_faces, 0] + offsets % repeated_widths
-        row = lower[local_faces, 1] + offsets // repeated_widths
-
-        triangles = projected_triangles[start:end]
-        a = triangles[local_faces, 0]
-        b = triangles[local_faces, 1]
-        c = triangles[local_faces, 2]
-        sample_x = col.astype(np.float64)
-        sample_y = row.astype(np.float64)
-        denominator = (
-            (b[:, 1] - c[:, 1]) * (a[:, 0] - c[:, 0])
-            + (c[:, 0] - b[:, 0]) * (a[:, 1] - c[:, 1])
-        )
-        denominator_epsilon = np.finfo(np.float64).eps * max(rows, cols) ** 2 * 16.0
-        valid = np.abs(denominator) > denominator_epsilon
-        weight_a = np.zeros_like(denominator)
-        weight_b = np.zeros_like(denominator)
-        weight_a[valid] = (
-            (b[valid, 1] - c[valid, 1]) * (sample_x[valid] - c[valid, 0])
-            + (c[valid, 0] - b[valid, 0]) * (sample_y[valid] - c[valid, 1])
-        ) / denominator[valid]
-        weight_b[valid] = (
-            (c[valid, 1] - a[valid, 1]) * (sample_x[valid] - c[valid, 0])
-            + (a[valid, 0] - c[valid, 0]) * (sample_y[valid] - c[valid, 1])
-        ) / denominator[valid]
-        weight_c = 1.0 - weight_a - weight_b
-        barycentric_epsilon = 1.0e-9
-        inside = (
-            valid
-            & (weight_a >= -barycentric_epsilon)
-            & (weight_b >= -barycentric_epsilon)
-            & (weight_c >= -barycentric_epsilon)
-        )
-        if np.any(inside):
-            selected_local = local_faces[inside]
-            depths = triangle_depth[start:end]
-            sample_depth = (
-                weight_a[inside] * depths[selected_local, 0]
-                + weight_b[inside] * depths[selected_local, 1]
-                + weight_c[inside] * depths[selected_local, 2]
-            )
-            yield (
-                start + selected_local,
-                row[inside] * cols + col[inside],
-                sample_depth,
-            )
-        start = end
 
 
 def raster_bounds(
@@ -950,59 +964,54 @@ def build_closure_proxy_artifact(
     status: dict[str, Any],
     source_points: np.ndarray,
     source_faces: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, dict[str, Any], Path, dict[str, Any]]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any], Path, dict[str, Any], np.ndarray, np.ndarray]:
+    from source_shell_preservation import select_preserved_shells
+
     update_run_status(args, status, "closure_proxy_started", voxel_pitch=pitch_status(args))
     max_extent = float(np.max(np.ptp(source_points, axis=0)))
-    atlas_seal_radius_world = (
-        max_extent
-        / max(float(args.sealed_exterior_grid), 1.0)
-        * float(args.sealed_exterior_radius_voxels)
-    )
-    closure_seal_radius_voxels = max(
-        1,
-        int(np.ceil(atlas_seal_radius_world / float(args.voxel_pitch))),
-    )
-    proxy_points, proxy_faces, remesh_report = voxel_watertight_remesh(
-        source_points,
-        source_faces,
-        args.voxel_pitch,
-        seal_radius_voxels=closure_seal_radius_voxels,
-        max_projection_distance=(
-            MAX_SOURCE_PROJECTION_DISTANCE_VOXELS * float(args.voxel_pitch)
-        ),
-        sdf_band_voxels=float(getattr(args, "sdf_band_voxels", 6.0)),
-        sdf_smoothing_sigma=float(getattr(args, "sdf_smoothing_sigma", 0.5)),
-        max_sdf_memory_gb=float(getattr(args, "max_sdf_memory_gb", 4.0)),
-        implicit_field_path=args.output_dir / "implicit_field.npz",
-    )
-    remesh_report["seal_radius_resolution"] = {
-        "atlas_grid_size": int(args.sealed_exterior_grid),
-        "atlas_radius_voxels": int(args.sealed_exterior_radius_voxels),
-        "atlas_radius_world": float(atlas_seal_radius_world),
-        "closure_radius_voxels": int(closure_seal_radius_voxels),
-        "closure_radius_world": float(
-            closure_seal_radius_voxels * float(args.voxel_pitch)
-        ),
-    }
-    proxy_points, intersection_repair = repair_closure_proxy_self_intersections(
-        proxy_points,
-        proxy_faces,
-        float(args.voxel_pitch),
-    )
+    atlas_seal_radius_world = max_extent / max(float(args.sealed_exterior_grid), 1.) * float(args.sealed_exterior_radius_voxels)
+    seal_radius = max(1, int(np.ceil(atlas_seal_radius_world / float(args.voxel_pitch))))
+    keep, preservation = select_preserved_shells(source_points, source_faces)
+    kept_rows = np.flatnonzero(keep)
+    kept_points, inverse = np.unique(source_faces[keep], return_inverse=True)
+    kept_faces = inverse.reshape(-1, 3)
+    if np.all(keep):
+        rebuilt_points, rebuilt_faces = np.empty((0, 3)), np.empty((0, 3), dtype=np.int64)
+        remesh_report = {"method": "certified_source_surface_retained", "pitch": float(args.voxel_pitch),
+                         "voxel_reconstruction_applied": False}
+    else:
+        repair_points, repair_faces = compact_mesh(source_points, source_faces, np.flatnonzero(~keep))
+        update_run_status(args, status, "closure_repair_regions_started", voxel_pitch=pitch_status(args))
+        rebuilt_points, rebuilt_faces, remesh_report = voxel_watertight_remesh(
+            repair_points, repair_faces, args.voxel_pitch, seal_radius_voxels=seal_radius,
+            max_projection_distance=MAX_SOURCE_PROJECTION_DISTANCE_VOXELS * float(args.voxel_pitch),
+            sdf_band_voxels=float(getattr(args, "sdf_band_voxels", 6.0)),
+            sdf_smoothing_sigma=float(getattr(args, "sdf_smoothing_sigma", .5)),
+            max_sdf_memory_gb=float(getattr(args, "max_sdf_memory_gb", 4.0)),
+            implicit_field_path=args.output_dir / "implicit_field.npz")
+        remesh_report["voxel_reconstruction_applied"] = True
+        iterations = int(getattr(args, "scaffold_smoothing_iterations", 0))
+        if iterations:
+            rebuilt_points, smoothing = smooth_closure_scaffold(rebuilt_points, rebuilt_faces, float(args.voxel_pitch), iterations)
+            remesh_report["scaffold_smoothing"] = smoothing
+    proxy_points = np.vstack((source_points[kept_points], rebuilt_points))
+    proxy_faces = np.vstack((kept_faces, rebuilt_faces + len(kept_points)))
+    retained_points = np.r_[kept_points, np.full(len(rebuilt_points), -1, dtype=np.int64)]
+    retained_faces = np.r_[kept_rows, np.full(len(rebuilt_faces), -1, dtype=np.int64)]
+    remesh_report["source_preservation"] = {**preservation, "all_faces_preserved": bool(np.all(keep)),
+        "repair_source_faces": int((~keep).sum()), "rebuilt_output_faces": len(rebuilt_faces)}
+    remesh_report["seal_radius_resolution"] = {"atlas_grid_size": int(args.sealed_exterior_grid),
+        "atlas_radius_voxels": int(args.sealed_exterior_radius_voxels), "atlas_radius_world": atlas_seal_radius_world,
+        "closure_radius_voxels": seal_radius, "closure_radius_world": seal_radius * float(args.voxel_pitch)}
+    proxy_points, intersection_repair = repair_closure_proxy_self_intersections(proxy_points, proxy_faces, float(args.voxel_pitch))
     remesh_report["self_intersection_repair"] = intersection_repair
     path = args.output_dir / "closure_proxy.vtp"
-    write_vtp(path, proxy_points, proxy_faces)
+    write_vtp(path, proxy_points, proxy_faces, {"retained_source_face_id": retained_faces},
+              point_data={"retained_source_point_id": retained_points})
     report = mesh_report(proxy_points, proxy_faces)
-    update_run_status(
-        args,
-        status,
-        "closure_proxy_written",
-        outputs={"closure_proxy_vtp": str(path)},
-        metrics={"closure_proxy": topology_brief(report)},
-        voxel_pitch=pitch_status(args),
-        remesh=remesh_report,
-    )
-    return proxy_points, proxy_faces, remesh_report, path, report
+    update_run_status(args, status, "closure_proxy_written", outputs={"closure_proxy_vtp": str(path)},
+                      metrics={"closure_proxy": topology_brief(report)}, voxel_pitch=pitch_status(args), remesh=remesh_report)
+    return proxy_points, proxy_faces, remesh_report, path, report, retained_points, retained_faces
 
 
 def resolve_voxel_pitch(args: argparse.Namespace, candidate_report: dict[str, Any]) -> None:
@@ -1129,6 +1138,14 @@ def apply_group_diagnostic_report_semantics(
 def main() -> int:
     args = parse_args()
     args.component_filter_thresholds = component_filter_thresholds(args)
+    if args.surface_strategy == "source-material" and not args._source_material_worker:
+        from mesh_timeout import run_mesh_with_timeout
+        command = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:], "--_source-material-worker"]
+        return run_mesh_with_timeout(args, command, timeout_seconds=args.source_timeout_seconds)
+    if args.surface_strategy == "projected-shell" and args.purpose != "print" and not args._projected_shell_worker:
+        from mesh_timeout import run_mesh_with_timeout
+        command = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:], "--_projected-shell-worker"]
+        return run_mesh_with_timeout(args, command, timeout_seconds=args.repair_timeout_seconds)
     prepare_output_dir(args)
     try:
         status = initial_run_status(args)
@@ -1162,6 +1179,27 @@ def component_filter_thresholds(args: argparse.Namespace) -> dict[str, float]:
 
 
 def run_pipeline(args: argparse.Namespace, status: dict[str, Any]) -> int:
+    if args.purpose == "print":
+        from print_mesh import run_print_pipeline
+        return run_print_pipeline(args, status)
+    if getattr(args, "surface_strategy", "projected-shell") == "source-material":
+        from source_material_repair import repair_source_file
+        update_run_status(args, status, "source_material_started")
+        report = repair_source_file(args.projection_target or args.input, args.output_dir,
+                                    max_error=args.source_max_error,
+                                    boundary_mode=args.source_boundary_mode,
+                                    policy_decisions=load_policy_decisions(args.policy_decisions),
+                                    grid_size=args.visibility_grid,
+                                    original_input=args.input,
+                                    certify_reverse_fidelity=args.certify_reverse_fidelity,
+                                    max_recovery_facets=getattr(args, "source_max_recovery_facets", None) or 1000,
+                                    union_backend=getattr(args, "source_union_backend", None) or "cgal",
+                                    assembly_context=getattr(args, "source_assembly_context", None),
+                                    progress=lambda stage: update_run_status(args, status, stage))
+        update_run_status(args, status, "completed", outputs=report["outputs"],
+                          metrics={"decision": report["decision"]},
+                          accepted_mesh_vtp=report["outputs"]["accepted_mesh_vtp"])
+        return 0 if report["accepted"] else 2
     update_run_status(args, status, "read_input")
     source_mesh = read_surface(args.input)
     points = np.asarray(source_mesh.points, dtype=np.float64)
@@ -1264,6 +1302,12 @@ def run_pipeline(args: argparse.Namespace, status: dict[str, Any]) -> int:
         stage1_faces,
         stage1_indices,
     )
+    seam_repair = {"status": "not_requested", "applied": False}
+    if args.stitch_tolerance:
+        from opening_repair import stitch_boundary_seams
+        update_run_status(args, status, "boundary_seam_stitching")
+        candidate_faces, seam_repair = stitch_boundary_seams(
+            candidate_points, candidate_faces, tolerance=args.stitch_tolerance)
     candidate_exterior_score = remap_face_values(
         stage1_indices,
         stage1_exterior_score,
@@ -1418,6 +1462,46 @@ def run_pipeline(args: argparse.Namespace, status: dict[str, Any]) -> int:
     policy_packet["evidence_report"] = policy_evidence
     policy_packet_path = args.output_dir / "ai_policy_packet.json"
     policy_decisions = resolve_policy_decisions(policy_packet, load_policy_decisions(args.policy_decisions))
+    opening_transactions = []
+    if args.policy_decisions:
+        from opening_repair import apply_opening_decisions
+        reviewed_faces, _generated, opening_transactions, applied = apply_opening_decisions(
+            candidate_points, candidate_faces, inventory_after, policy_decisions, default_action="cap",
+        )
+        (args.output_dir / "opening_transactions.json").write_text(json.dumps(opening_transactions, indent=2), encoding="utf-8")
+        policy_packet_path.write_text(json.dumps(policy_packet, indent=2), encoding="utf-8")
+        if not applied:
+            raise ValueError("opening decisions were not applied; unresolved or preserved free boundaries require wall geometry (use print thicken), and cannot enter global shell closure")
+        added = len(reviewed_faces) - len(candidate_faces)
+        candidate_faces = reviewed_faces
+        candidate_sources = np.r_[candidate_sources, np.full(added, -1, dtype=np.int64)]
+        candidate_exterior_score = np.r_[candidate_exterior_score, np.ones(added)]
+        candidate_sealed_exterior_mask = np.r_[candidate_sealed_exterior_mask, np.ones(added, dtype=bool)]
+        candidate_external_directions = np.vstack([candidate_external_directions, np.zeros((added, 3))])
+        candidate_path = write_source_preserving_candidate(
+            args, candidate_points, candidate_faces, candidate_sources,
+            exterior_face_score=candidate_exterior_score,
+            sealed_exterior_face_mask=candidate_sealed_exterior_mask,
+            face_external_directions=candidate_external_directions,
+        )
+        candidate_report = mesh_report(candidate_points, candidate_faces)
+        inventory_after = build_inventory(
+            candidate_points, candidate_faces, candidate_sources, "after_reviewed_opening_caps",
+            max_items=args.policy_item_limit, exterior_face_score=candidate_exterior_score,
+            sealed_exterior_face_mask=candidate_sealed_exterior_mask,
+            component_thresholds=args.component_filter_thresholds,
+        )
+
+    projection_target = getattr(args, "projection_target", None)
+    projection_points, projection_faces = candidate_points, candidate_faces
+    projection_reliable = (candidate_exterior_score > 0) | candidate_sealed_exterior_mask
+    projection_normals = None
+    if projection_target is not None:
+        reviewed_surface = read_surface(projection_target, clean=False)
+        projection_points = np.asarray(reviewed_surface.points, dtype=np.float64)
+        projection_faces = triangle_faces(reviewed_surface)
+        projection_reliable = None
+        projection_normals = reviewed_surface.point_data.get("Normals")
 
     (
         stage2_points,
@@ -1425,6 +1509,8 @@ def run_pipeline(args: argparse.Namespace, status: dict[str, Any]) -> int:
         remesh_report,
         closure_proxy_path,
         closure_proxy_report,
+        retained_source_points,
+        retained_source_faces,
     ) = build_closure_proxy_artifact(
         args,
         status,
@@ -1432,6 +1518,10 @@ def run_pipeline(args: argparse.Namespace, status: dict[str, Any]) -> int:
         candidate_faces,
     )
     proxy_intersection_repair = remesh_report["self_intersection_repair"]
+    preserved_vertices = retained_source_points >= 0
+    preserved_faces = retained_source_faces >= 0
+    if projection_target is None and projection_reliable is not None:
+        projection_reliable[retained_source_faces[preserved_faces]] = True
 
     update_run_status(args, status, "source_projection_started", voxel_pitch=pitch_status(args))
     projection_thresholds = ProjectionThresholds(
@@ -1441,15 +1531,18 @@ def run_pipeline(args: argparse.Namespace, status: dict[str, Any]) -> int:
         orientation_vote_min_margin=0.02,
         source_edge_barycentric_margin=0.0,
         collision_tolerance_bbox_ratio=1e-8,
+        cross_component_jump_ratio=getattr(args, "cross_component_jump_ratio", None),
     )
     projected_points, projected_faces, projection_provenance, projection_report = project_closure_to_source(
         stage2_points,
         stage2_faces,
-        candidate_points,
-        candidate_faces,
+        projection_points,
+        projection_faces,
         thresholds=projection_thresholds,
-        reliable_source_face_mask=(candidate_exterior_score > 0) | candidate_sealed_exterior_mask,
+        reliable_source_face_mask=projection_reliable,
+        preserved_vertex_mask=preserved_vertices,
     )
+    projection_report["source_query"]["path"] = str(projection_target or candidate_path)
     projection_report["sealed_exterior_construction"] = remesh_report.get(
         "exterior_volume"
     )
@@ -1457,6 +1550,7 @@ def run_pipeline(args: argparse.Namespace, status: dict[str, Any]) -> int:
         "1": "source_projected",
         "2": "mixed_source_sdf_transition",
         "3": "sdf_generated",
+        "4": "retained_prepared_source_surface",
     }
     projection_report["resolution_context"] = {
         "closure_pitch": float(args.voxel_pitch),
@@ -1474,6 +1568,40 @@ def run_pipeline(args: argparse.Namespace, status: dict[str, Any]) -> int:
         certified_proxy_report=proxy_intersection_repair["final_self_intersection"],
     )
     projection_report["closure_proxy_self_intersection_repair"] = proxy_intersection_repair
+    projection_report["source_preservation"] = {**remesh_report["source_preservation"],
+        "geometry_unchanged": bool(np.array_equal(projected_points[preserved_vertices],
+            candidate_points[retained_source_points[preserved_vertices]]))}
+    if np.any(preserved_faces):
+        orientation_ok = False
+        if self_intersection.get("passed"):
+            from print_geometry import orient_material
+            oriented, _ = orient_material(trimesh.Trimesh(projected_points, projected_faces, process=False))
+            orientation_ok = bool(np.all(np.logical_or.reduce([
+                np.all(np.roll(np.asarray(oriented.faces), shift, axis=1) == projected_faces, axis=1)
+                for shift in range(3)])))
+        projection_report["source_preservation"]["assembled_material_orientation"] = orientation_ok
+    if np.any(preserved_faces) and not np.all(preserved_faces):
+        rebuilt_points, rebuilt_faces = compact_mesh(projected_points, projected_faces, np.flatnonzero(~preserved_faces))
+        projection_report["reconstructed_region_metrics"] = mesh_report(rebuilt_points, rebuilt_faces)
+    projection_provenance["point_data"]["retained_source_point_id"] = retained_source_points
+    projection_provenance["cell_data"]["retained_source_face_id"] = retained_source_faces
+    projection_provenance["cell_data"]["face_origin"][preserved_faces] = 4
+    projection_provenance["point_data"]["Normals"] = interpolate_source_normals(
+        projected_points, projected_faces, projection_points, projection_faces,
+        projection_provenance, projection_normals,
+    )
+    source_corners = source_mesh.cell_data.get("corner_normals")
+    if source_corners is not None and np.any(preserved_faces):
+        corners = projection_provenance["point_data"]["Normals"][projected_faces].reshape(-1, 9)
+        original_ids = candidate_sources[retained_source_faces[preserved_faces]]
+        known = original_ids >= 0
+        offset = source_mesh.n_verts + source_mesh.n_lines
+        corners[np.flatnonzero(preserved_faces)[known]] = np.asarray(source_corners)[offset + original_ids[known]]
+        projection_provenance["cell_data"]["corner_normals"] = corners
+    projection_report["normal_transfer"] = {
+        "method": "barycentric_source_point_normals_on_projected_vertices",
+        "geometry_changed": False, "fallback_normals": "candidate_geometry",
+    }
     projected_candidate_path = write_source_projected_watertight_candidate(
         args,
         projected_points,
@@ -1602,6 +1730,21 @@ def run_pipeline(args: argparse.Namespace, status: dict[str, Any]) -> int:
         projected_visual_drift,
     )
     apply_group_diagnostic_report_semantics(report, group_filter)
+    report["opening_transactions"] = opening_transactions
+    report["boundary_stitch"] = seam_repair
+    if args.purpose == "cfd":
+        if report["decision"]["status"] == "accepted":
+            from cfd_surface_refine import refine_cfd_surface
+
+            update_run_status(args, status, "cfd_surface_refinement_started")
+            refinement = refine_cfd_surface(
+                Path(report["outputs"]["accepted_mesh_vtp"]), projection_target or candidate_path,
+                args.output_dir / "cfd", max_edge_length=args.cfd_max_edge_length,
+                max_output_faces=args.cfd_max_output_faces,
+            )
+            record_cfd_refinement(report, refinement)
+        else:
+            report["cfd_surface_refinement"] = {"status": "skipped", "reason": "watertight input was not accepted"}
     html_path = args.output_dir / "two_stage_report.html"
     report["outputs"]["html_report"] = str(html_path)
     report_path = args.output_dir / "two_stage_report.json"

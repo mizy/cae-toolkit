@@ -435,6 +435,7 @@ def classify_one(
     return {
         **base,
         "classification": "part_perimeter_or_opening_unknown",
+        "requires_policy": True,
         "detector_reason": reason,
         "operator": "skill_semantic_review",
         "decision_evidence": decision_evidence,

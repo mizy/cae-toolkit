@@ -2,6 +2,43 @@
 
 Build a geometry-driven watertight exterior shell from a mesh input.
 
+The default projected-shell workflow retains certified, nonintersecting closed source shells
+and reconstructs only the remaining surface set. A valid complete source bypasses voxel
+reconstruction. `--stitch-tolerance T` enables bounded matching-edge sewing; zero (the default)
+keeps approximate sewing disabled. `--repair-timeout-seconds 60` bounds the complete projected-shell
+worker, including native calls. That main route retains complete connected shells. The separate
+[local voxel operator](#bounded-local-voxel-repair) now supports reviewed patches inside a closed
+component; automatic region selection and integration into the main route remain pending.
+
+The default purpose is `watertight`. Add `--purpose cfd --cfd-max-edge-length LENGTH` to the worker
+to run optional source-based conforming surface refinement after shell acceptance. `LENGTH` uses
+input coordinate units. The accepted pre-refinement shell is retained when CFD quality gates fail.
+See [SKILL.md](SKILL.md#optional-cfd-surface-postprocessing) for the separate-stage CLI and gates.
+
+For source-triangle preservation, `--surface-strategy source-material --source-max-error E`
+uses an error budget in input units. This optional path builds and validates closed material
+surfaces with reviewed boundary decisions; it does not certify a CFD fluid region or printing
+thickness. See [source-preserving material closure](SKILL.md#source-preserving-material-closure-for-arbitrary-meshes)
+for the review workflow and fidelity limits.
+The optional `--source-union-backend manifold` is a faster positive-shell path with the same
+acceptance gates; unsupported or invalid inputs remain rejected.
+The experimental `--source-union-backend local` repairs faulty components before assembly,
+with bounded numerical corrections and failure rollback. See the
+[component-first workflow](references/local-material-repair.md); whole-model acceptance is still required.
+
+Use `--purpose print --print-units mm` for material-preserving 3D print preparation. Optional
+`--print-size-mm 200` sets the final longest dimension; `--print-up-axis y` maps input Y-up to
+printing Z. Closed holes and nested cavities are retained by default. Reviewed planar caps,
+explicit `solid`/`hollow`/`thicken` modes, and Boolean part union have separate geometry gates.
+See [SKILL.md](SKILL.md#print-purpose-material-repair) for parameters and limitations.
+
+`print_report.html` embeds interactive clipping, synchronized views, original overlay, generated
+surfaces, source-distance and sampled-wall fields. Opening selections export fingerprint-bound
+decision JSON for a worker rerun. STL and unit-aware 3MF candidates are independently read back;
+accepted file aliases stay empty on failure. `print_layers.json` contains every geometric layer.
+An optional explicit PrusaSlicer-compatible FFF CLI and profile can generate/check ASCII extrusion G-code;
+without them `printer_ready` remains false. Physical printing is not certified by mesh acceptance.
+
 All commands below assume the working directory is this skill directory (`.agents/skills/mesh-watertight-repair/`).
 
 ## Skill entrypoint and worker boundary
@@ -60,6 +97,58 @@ OUTPUT_DIR/
 
 `closure_proxy.vtp` is always diagnostic. Only the path named by
 `outputs.accepted_mesh_vtp` represents an accepted engineering result.
+
+## Bounded local voxel repair
+
+`local_patch_worker.py` is a model-agnostic geometry operator for deterministic fixed-seam
+replacement of one explicitly selected, source-bound region. Create the `--regions` JSON with
+`local_defect_regions.extract_defect_regions()` from the same triangulated input and reviewed
+defect face rows; then select one `ready` region by its `id`. The worker checks the packet's source
+geometry hash before changing anything.
+
+```bash
+python scripts/local_patch_worker.py INPUT_MESH \
+  --regions REGIONS.json --region REGION_ID \
+  --pitch PITCH --max-error MAX_ERROR \
+  --output-dir OUTPUT_DIR --timeout-seconds 20
+```
+
+`PITCH` and `MAX_ERROR` are positive values in input coordinate units. Defaults cap the run at
+2,000,000 voxels, 2,000 selected faces, 100,000 patch triangles, a 20-degree seam-angle increase,
+and a 20-second process-group deadline. The input context is limited to 20,000 faces. All original
+points and triangles outside the selected region remain unchanged.
+
+This operator supports one closed, consistently wound, positive-volume component and one simple
+cut loop. It does not add thickness to open sheets. It checks exact-predicate intersections for
+generated faces and performs VTP readback; its source-distance bounds use floating-point queries,
+not an exact-arithmetic Hausdorff proof. The report writes `accepted_local_candidate_vtp` when the
+local replacement passes and `accepted_mesh_vtp` only when the whole mesh also passes. Exit 0 means
+whole-mesh acceptance, exit 3 means local-patch acceptance while source defects remain elsewhere,
+exit 2 means rejected input or repair, and exit 124 means timeout. Local acceptance does not
+establish full-model, CFD, or print readiness; `engineering_ready` remains false.
+
+For a closed component with native triangle self-intersections, explicitly select
+`--method intersection-cut` and omit `--pitch`. This runs `repair_local_intersection_cut()`:
+CGAL classifies/cuts the bounded closed component, and every triangle outside the selected ROI
+must survive exactly once with its original oriented coordinates. Unchanged triangles inside the
+ROI are retained too. New pieces inherit their exact source-face attributes and corner normals.
+The source-error, topology, seam and readback gates remain required; no thickness is introduced.
+This method is selected explicitly, with `cut_intersections` or `local_intersection_cut` intent
+when a decision is supplied. It does not automatically replace the default voxel method.
+
+The voxel method can try a source-defined common contour after direct zipper rejection. This
+uses shared contour nodes instead of a cross-boundary triangle strip, with a 4,096-node cap and
+the same 20-degree seam constraint. Dense planar repair is covered by an end-to-end test. Sharp
+folded contours can still fail; matching positions alone does not establish a valid seam.
+
+The worker calls `repair_mesh_patch()` for attribute-preserving assembly and
+`repair_local_voxel_patch()` for geometry. The latter uses `extract_defect_regions()` to bind the
+cut, `build_local_sdf_patch()` for ROI-only reconstruction, and `connect_source_collar()` /
+`stitch_boundary_loops()` for the fixed seam. Reconstruction reuses
+`project_closure_to_source()`; acceptance reuses `geometry_gate_arrays()` and
+`source_to_candidate_bound()`. The file worker reuses `roundtrip_validation()`,
+`write_html_report()`, and the existing timeout supervisor's process-group stop operation.
+Both geometry methods reuse `local_patch_checks` for seam, local intersection and Euler checks.
 
 When semantic review is needed, the Skill agent may use `agent_observation.py` and
 `agent_repair_contract.py` to build registered evidence, hash-bound decisions, transaction records,
@@ -140,6 +229,12 @@ OUTPUT_DIR/
 Only `outputs.accepted_mesh_vtp` is an accepted result. A descriptive filename is not acceptance evidence by itself.
 
 ## Full-resolution issue report
+
+All HTML reports embed the bundled vtk.js renderer and model data for offline interactive 3D
+inspection before the tables. Drag to rotate, scroll to zoom, Shift-drag to pan; each view has
+mesh-edge, opacity, and reset controls. `VTK_JS_PATH` optionally overrides the bundled renderer
+with a local file. Reports never download rendering code at generation or viewing time. Workflow
+reports can select labeled stages with `outputs.mesh_previews: [{label, path}, ...]`.
 
 ```bash
 python scripts/watertight_issue_markers.py \

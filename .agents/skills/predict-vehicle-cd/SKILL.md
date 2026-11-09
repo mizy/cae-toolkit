@@ -71,6 +71,43 @@ The predictor is intentionally self-contained:
 - When `--category` is provided, adds a small same-category ranking bonus before top-k weighting.
 - Computes Cd with inverse-distance softmax weighting over top-k references.
 
+## Cached whole-car multiview similarity
+
+Use `scripts/vehicle_cd_multiview.py build-library` and `predict` for the optional
+float-preserving five-view matcher. Read `references/multiview.md` for the cache,
+query format, condition assumptions, self-reference exclusion and same-fold
+validation results. The first 26-car comparison has slightly worse average error
+than the legacy side matcher, so keep the legacy method available as the baseline.
+
+## Supervised five-view Cd/Cl learning
+
+For training and deploying the depth-image CNN predictor, read
+`references/learning.md`. It covers five-view preparation, explicit geometry
+conventions, Cd-only or Cd/Cl regression, family-disjoint validation, and the
+`parameters` / `four` / `five` ablations. The existing similarity predictor remains
+a separate baseline; its mixed-condition reference labels are exploratory data,
+not matched-condition CFD truth. Install optional `requirements-learning.txt`.
+
+For public geometry/coefficient collection, read `references/public-datasets.md`.
+For the early physics-only conditional flow experiments, read
+`references/physics-flow-prototype.md`. These are two-dimensional analytical
+verification cases, not vehicle-flow models or substitutes for CFD.
+For the real-vehicle 3D weak-supervision experiment using the frozen dataset,
+read `references/vehicle-flow-weak-supervision.md`. It records the proxy boundary
+and closure assumptions, integration checks, training and fixed-weight inference.
+For full-view detail pooling, optional condition-dependent view attention and the
+frozen-split comparison command, read `references/learning-cnn-design.md`.
+For the paired 32/128 per-view compression experiment with a shared Cd/Cl head,
+read `references/learning-feature-width.md`.
+Keep matched-condition CFD pools separate from the assumed-condition reference
+pool. A geometry-disjoint split within one base family must be reported as such.
+Read `references/learning-full-attention.md` for full-source collection, exact
+Windsor alias removal, and the retained channel/spatial/view attention workflow.
+Read `references/learning-builtin-inclusive.md` for the conditional attention
+model that actually trains all 26 built-in Cd cases together with the CFD pools.
+Its declared source profiles preserve assumed conditions, mask missing Cl, and
+limit the built-in profile's CLI output to Cd.
+
 ## Reference Library
 
 The packaged library lives in `assets/reference-library/reference_cars.json` with side-view artifacts beside it. The Cd values include source provenance in each `cd_source`; align conditions before using the scalar estimate for engineering decisions.

@@ -28,8 +28,8 @@ def build_inventory(
     sealed_exterior_face_mask: np.ndarray | None = None,
     component_thresholds: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    metrics = mesh_report(points, faces)
     topology, edge_to_faces = edge_topology(faces)
+    metrics = mesh_report(points, faces, edge_data=(topology, edge_to_faces))
     component_ids = face_component_ids(faces, edge_to_faces)
     boundary_regions = connected_edge_regions(
         edge_to_faces,

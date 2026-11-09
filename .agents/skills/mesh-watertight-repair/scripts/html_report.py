@@ -20,11 +20,12 @@ def render_html(report: dict[str, Any], title: str, report_dir: Path) -> str:
     preview_meshes = mesh_previews(report, report_dir)
     body = [
         hero_section(title, report),
+        viewer_section(preview_meshes),
+        print_artifact_section(report, report_dir),
         summary_section(report),
         diagnostics_section(report),
         contract_section(report),
         stages_section(report),
-        viewer_section(preview_meshes),
         watertight_artifact_section(report, report_dir),
         trace_section(report),
         change_section(report),
@@ -40,6 +41,7 @@ def render_html(report: dict[str, Any], title: str, report_dir: Path) -> str:
         "<html>",
         "<head>",
         '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
         f"<title>{text(title)}</title>",
         "<style>",
         css(),
@@ -85,6 +87,7 @@ def summary_section(report: dict[str, Any]) -> str:
 def diagnostics_section(report: dict[str, Any]) -> str:
     return section_from_keys(report, "Diagnostics", [
         "parameters",
+        "acceptance_checks",
         "limitations",
         "group_filter",
         "workflow_decision",
@@ -92,6 +95,10 @@ def diagnostics_section(report: dict[str, Any]) -> str:
         "size_field",
         "refinement_iterations",
         "comparisons",
+        "cfd_surface_refinement",
+        "assembly_context_validation",
+        "printing",
+        "opening_transactions",
         "diagnostics",
     ])
 
@@ -206,6 +213,25 @@ def outputs_section(report: dict[str, Any]) -> str:
     return section("Outputs", object_table(outputs))
 
 
+def print_artifact_section(report: dict[str, Any], report_dir: Path) -> str:
+    outputs = report.get("outputs", {})
+    rows = outputs.get("print_files", [])
+    if not rows:
+        return ""
+    accepted = bool(outputs.get("accepted_mesh_vtp"))
+    links = []
+    for row in rows:
+        path = resolve_path(row["path"], report_dir)
+        if path and path.is_file():
+            try:
+                href = path.resolve().relative_to(report_dir.resolve()).as_posix()
+            except ValueError:
+                href = path.resolve().as_uri()
+            links.append(f'<a download href="{text(href)}">{text(path.name)}</a>')
+    role = "几何验收通过；设备切片状态见下方报告。" if accepted else "诊断候选，未通过打印几何验收。"
+    return section("Print files / 打印文件", f'<p>{role}</p><p>' + ' · '.join(links) + '</p>')
+
+
 def visual_section(report: dict[str, Any], report_dir: Path) -> str:
     items = visual_items(report)
     if not items:
@@ -231,15 +257,45 @@ def viewer_section(preview_meshes: list[dict[str, Any]]) -> str:
         return ""
     cards = []
     for index, mesh in enumerate(preview_meshes):
+        if mesh.get("error"):
+            cards.append(f'<div><h3>{text(mesh["label"])}</h3><p>3D model unavailable: {text(mesh["error"])}</p><p>{text(mesh["source"])}</p></div>')
+            continue
         cards.append("\n".join([
             "<div>",
             f"<h3>{text(mesh['label'])}</h3>",
             f'<div class="vtk-viewer" id="vtk-viewer-{index}"></div>',
+            '<div class="viewer-controls">',
+            f'<button type="button" id="vtk-reset-{index}">Reset view / 重置视角</button>',
+            f'<label><input type="checkbox" id="vtk-edges-{index}"> Mesh edges / 网格边</label>',
+            f'<label><input type="checkbox" id="vtk-smooth-{index}" checked> 平滑光照（不移动顶点）</label>',
+            f'<label><input type="checkbox" id="vtk-source-normals-{index}" checked> 使用文件法线（不移动顶点）</label>' if mesh.get("normals") else '',
+            f'<label>Opacity / 不透明度 <input type="range" id="vtk-opacity-{index}" min="0.1" max="1" step="0.05" value="1"></label>',
+            f'<label>剖切 <select id="vtk-cut-axis-{index}"><option value="">关闭</option><option value="0">X</option><option value="1">Y</option><option value="2">Z</option></select><input aria-label="剖切位置" type="range" id="vtk-cut-position-{index}" min="0" max="1" step="0.01" value="0.5"></label>',
+            f'<label><input type="checkbox" id="vtk-overlay-{index}"> 叠加首个模型</label>' if index else '',
+            f'<label>着色 <select id="vtk-field-{index}"><option value="">默认</option>' + ''.join(f'<option value="{text(key)}">{text(label)}</option>' for key, label in (("print_generated_face", "新增补面"), ("print_source_distance_mm", "源表面距离 mm"), ("print_thickness_mm", "采样壁厚 mm，灰色为未采样"), ("projection_fallback_fraction", "体素回退比例（红色=未投影）")) if key in mesh.get("fields", {})) + '</select></label>',
+            f'<span id="vtk-field-range-{index}"></span>',
+            opening_controls(mesh, index),
+            '</div>',
             proxy_weight_legend(mesh),
             viewer_mesh_caption(mesh),
             "</div>",
         ]))
-    return section("3D Mesh Evidence", '<div class="viewer-grid">' + "\n".join(cards) + "</div>")
+    instructions = '<p>拖动旋转 · 滚轮缩放 · Shift + 拖动平移。各阶段可独立检查；候选模型的展示不代表验收通过。</p>'
+    sync = '<label><input type="checkbox" id="vtk-sync-cameras"> 同步各阶段视角</label>'
+    return section("3D Mesh Evidence", instructions + sync + '<div class="viewer-grid">' + "\n".join(cards) + "</div>")
+
+
+def opening_controls(mesh: dict[str, Any], index: int) -> str:
+    regions = mesh.get("regions", [])
+    if not regions:
+        return ""
+    options = ''.join(f'<option value="{i}">{text(row["id"])} · {text(str(row.get("geometry_classification")))}</option>' for i, row in enumerate(regions))
+    return (
+        f'<label>孔洞区域 <select id="vtk-region-{index}"><option value="">选择区域</option>{options}</select></label>'
+        f'<label>下一轮决策 <select id="vtk-region-action-{index}"><option value="defer">待定</option><option value="cap">封闭</option><option value="preserve">保留开口（需壁厚）</option><option value="reject">拒绝</option></select></label>'
+        f'<button type="button" id="vtk-policy-export-{index}">下载绑定当前模型的决策 JSON</button>'
+        '<small>选区高亮相邻面；导出的决策需由几何 worker 执行并重新验收。</small>'
+    )
 
 
 def viewer_mesh_caption(mesh: dict[str, Any]) -> str:
@@ -249,6 +305,8 @@ def viewer_mesh_caption(mesh: dict[str, Any]) -> str:
     ]
     if mesh.get("viewer_triangle_limit"):
         parts.append(f"viewer triangle limit: {mesh['viewer_triangle_limit']}")
+    if mesh.get("opening_review_unavailable"):
+        parts.append(text(mesh["opening_review_unavailable"]))
     if mesh.get("proxy_weights"):
         parts.append("source/proxy blend heatmap from proxy_weight cell data")
     if mesh.get("issue_values"):
@@ -466,8 +524,14 @@ pre {
 .viewer-grid {
   display: grid;
   gap: 18px;
-  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
+.viewer-controls { display: flex; flex-wrap: wrap; gap: 12px; margin: 10px 0; align-items: center; }
+.viewer-controls label { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.viewer-controls button { padding: 6px 10px; cursor: pointer; }
+.viewer-controls label { max-width: 100%; min-width: 0; }
+.viewer-controls select { max-width: 350px; }
+.viewer-grid p { overflow-wrap: anywhere; }
 .vtk-viewer {
   background: #0b0f12;
   border: 1px solid rgba(167, 216, 207, 0.32);

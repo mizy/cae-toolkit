@@ -296,6 +296,7 @@ def partial_outputs(output_dir: Path) -> dict[str, Any]:
         "source_preserving_candidate_vtp": output_dir / "source_preserving_candidate.vtp",
         "closure_proxy_vtp": output_dir / "closure_proxy.vtp",
         "source_projected_watertight_candidate_vtp": output_dir / "source_projected_watertight_candidate.vtp",
+        "source_material_candidate_vtp": output_dir / "source_material_candidate.vtp",
     }
     outputs: dict[str, Any] = {
         "accepted_mesh_vtp": None,
@@ -309,7 +310,7 @@ def partial_outputs(output_dir: Path) -> dict[str, Any]:
     rejected = next(
         (
             path
-            for path in (paths["source_projected_watertight_candidate_vtp"],)
+            for path in (paths["source_material_candidate_vtp"], paths["source_projected_watertight_candidate_vtp"])
             if path.exists()
         ),
         paths["source_preserving_candidate_vtp"],
@@ -371,7 +372,19 @@ def write_failure_audit_report(args: Any, status: dict[str, Any]) -> None:
 
 
 def run_parameters(args: Any) -> dict[str, Any]:
-    return {
+    parameters = {
+        "purpose": getattr(args, "purpose", "watertight"),
+        "surface_strategy": getattr(args, "surface_strategy", "projected-shell"),
+        "source_max_error": getattr(args, "source_max_error", None),
+        "source_boundary_mode": getattr(args, "source_boundary_mode", "review"),
+        "source_max_recovery_facets": getattr(args, "source_max_recovery_facets", None),
+        "source_union_backend": getattr(args, "source_union_backend", None),
+        "stitch_tolerance": getattr(args, "stitch_tolerance", 0.),
+        "repair_timeout_seconds": getattr(args, "repair_timeout_seconds", None),
+        "source_timeout_seconds": getattr(args, "source_timeout_seconds", None),
+        "certify_reverse_fidelity": getattr(args, "certify_reverse_fidelity", False),
+        "cfd_max_edge_length": getattr(args, "cfd_max_edge_length", None),
+        "cfd_max_output_faces": getattr(args, "cfd_max_output_faces", 2_000_000),
         "input": str(args.input),
         "target_name": args.target_name,
         "group_source_gltf": str(args.group_source_gltf) if args.group_source_gltf else None,
@@ -392,9 +405,15 @@ def run_parameters(args: Any) -> dict[str, Any]:
         "voxel_pitch_source": getattr(args, "voxel_pitch_source", "explicit"),
         "voxel_pitch_bbox_divisor": getattr(args, "voxel_pitch_bbox_divisor", None),
         "voxel_pitch_bbox_max_extent": getattr(args, "voxel_pitch_bbox_max_extent", None),
+        "scaffold_smoothing_iterations": getattr(args, "scaffold_smoothing_iterations", 0),
+        "cross_component_jump_ratio": getattr(args, "cross_component_jump_ratio", None),
+        "projection_target": str(args.projection_target) if getattr(args, "projection_target", None) else None,
         "policy_item_limit": args.policy_item_limit,
         "component_filter_thresholds": getattr(args, "component_filter_thresholds", None),
     }
+    if getattr(args, "purpose", None) == "print":
+        parameters.update({key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items() if key.startswith("print_")})
+    return parameters
 
 
 def command_fingerprint(args: Any) -> str:

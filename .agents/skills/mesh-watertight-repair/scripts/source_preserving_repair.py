@@ -38,7 +38,7 @@ def run_deterministic_repair(
     candidate_sources = source_indices.astype(np.int64, copy=True)
     passes: list[dict[str, Any]] = []
 
-    candidate_points, candidate_faces, candidate_sources, pass_report = apply_keep_operator(
+    candidate_points, candidate_faces, candidate_sources, pass_report, metrics = apply_keep_operator(
         "repair_pass_001",
         "remove_degenerate_source_triangles",
         "remove_zero_area_or_near_zero_edge_faces",
@@ -50,7 +50,7 @@ def run_deterministic_repair(
     )
     passes.append(pass_report)
 
-    candidate_points, candidate_faces, candidate_sources, pass_report = apply_keep_operator(
+    candidate_points, candidate_faces, candidate_sources, pass_report, _ = apply_keep_operator(
         "repair_pass_002",
         "remove_exact_duplicate_source_triangles",
         "remove_faces_with_identical_vertex_sets_after_import_cleaning",
@@ -59,6 +59,7 @@ def run_deterministic_repair(
         candidate_sources,
         duplicate_keep_mask(candidate_faces),
         {"duplicate_key": "sorted_cleaned_vertex_indices"},
+        before_metrics=metrics,
     )
     passes.append(pass_report)
     return candidate_points, candidate_faces, candidate_sources, passes
@@ -538,22 +539,24 @@ def apply_keep_operator(
     source_indices: np.ndarray,
     keep: np.ndarray,
     thresholds: dict[str, Any],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    before = mesh_report(points, faces)
+    *,
+    before_metrics: dict[str, Any] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any], dict[str, Any]]:
+    before = mesh_report(points, faces) if before_metrics is None else before_metrics
     removed_sources = source_indices[~keep]
     if np.all(keep):
-        return points, faces, source_indices, pass_row(pass_id, name, "skipped", method, thresholds, before, before, [])
+        return points, faces, source_indices, pass_row(pass_id, name, "skipped", method, thresholds, before, before, []), before
     if not np.any(keep):
         return points, faces, source_indices, pass_row(
             pass_id, name, "failed", method, thresholds, before, before, removed_sources, "operator would remove every face"
-        )
+        ), before
     local_indices = np.flatnonzero(keep)
     next_points, next_faces = compact_mesh(points, faces, local_indices)
     next_sources = source_indices[local_indices]
     after = mesh_report(next_points, next_faces)
     return next_points, next_faces, next_sources, pass_row(
         pass_id, name, "applied", method, thresholds, before, after, removed_sources
-    )
+    ), after
 
 
 def pass_row(

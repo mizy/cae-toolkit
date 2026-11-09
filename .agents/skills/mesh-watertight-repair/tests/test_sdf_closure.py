@@ -17,6 +17,7 @@ from sdf_closure import (  # noqa: E402
     bounded_sdf_smoothing,
     build_tsdf_closure,
     sdf_memory_preflight,
+    smooth_closure_scaffold,
 )
 
 
@@ -45,6 +46,20 @@ def cube_points(half_extent: float = 1.0) -> np.ndarray:
 
 
 class SignedDistanceClosureTest(unittest.TestCase):
+    def test_scaffold_smoothing_preserves_connectivity_and_half_pitch_bound(self) -> None:
+        mesh = trimesh.creation.icosphere(subdivisions=2)
+        points = np.asarray(mesh.vertices).copy()
+        faces = np.asarray(mesh.faces).copy()
+        points[0] *= 1.1
+        smooth, report = smooth_closure_scaffold(points, faces, 0.01, 30)
+        motion = np.linalg.norm(smooth - points, axis=1)
+        self.assertGreater(float(motion.max()), 0.)
+        self.assertLessEqual(float(motion.max()), 0.005 + 1e-15)
+        result = trimesh.Trimesh(vertices=smooth, faces=faces, process=False)
+        self.assertTrue(result.is_watertight)
+        self.assertEqual(result.euler_number, mesh.euler_number)
+        self.assertFalse(report["connectivity_changed"])
+
     def test_cube_writes_signed_field_and_watertight_zero_surface(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory) / "implicit_field.npz"

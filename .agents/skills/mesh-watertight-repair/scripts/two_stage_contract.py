@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from repair_report import two_stage_repair_report
+from repair_report import topology_snapshot, trace_row, two_stage_repair_report
 from source_projected_contract import (
     build_projection_gates,
     projection_comparisons,
@@ -48,6 +48,9 @@ def build_report(
         post_write_validation,
     )
     shell_policy = watertight_shell_policy(args.target_name)
+    if getattr(args, "purpose", "watertight") == "cfd":
+        shell_policy["semantic_review_applicability"] = "required_for_acceptance"
+        shell_policy["source"] = "cfd_candidate_requires_opening_review"
     gates = build_projection_gates(
         projected_metrics,
         comparisons,
@@ -59,6 +62,17 @@ def build_report(
         shell_policy,
     )
     decision = build_decision(gates, projected_path)
+    if getattr(args, "purpose", "watertight") == "cfd" or args.policy_decisions:
+        from source_preserving_repair import gate
+        items = policy_packet.get("items", [])
+        applied = (not policy_packet.get("truncated", True)
+                   and policy_packet.get("item_count_total") == len(items) == len(policy_decisions)
+                   and all(row.get("status") == "decided" and row.get("applied_by_pass_id")
+                           for row in policy_decisions))
+        gates["opening_policy_resolved"] = gate(applied, policy_decisions,
+            "every detected opening reviewed and executed by deterministic geometry operators",
+            "opening decisions are missing, incomplete or not executed")
+        decision = build_decision(gates, projected_path)
     outputs = accepted_outputs(
         outputs,
         decision,
@@ -95,7 +109,7 @@ def build_report(
         derived_artifacts.append(projected_path)
     truth = input_truth(Path(args.input), group_filter, derived_artifacts)
     truth["acceptance_source"] = (
-        "closure_proxy_connectivity_plus_deterministic_source_surface_positions"
+        "retained_prepared_source_surfaces_plus_certified_reconstruction_and_source_projection"
     )
     return {
         "decision": decision,
@@ -126,7 +140,9 @@ def build_report(
         },
         "target": {
             "name": args.target_name,
-            "opening_policy": "seal all openings for the requested watertight exterior shell",
+            "opening_policy": ("review every detected opening for CFD before accepting the shell"
+                               if getattr(args, "purpose", "watertight") == "cfd"
+                               else "seal all openings for the requested watertight exterior shell"),
             "shell_policy": shell_policy,
             "component_count_role": "diagnostic_only",
         },
@@ -213,6 +229,11 @@ def stages_report(
 
 def parameters_report(args: Any) -> dict[str, Any]:
     return {
+        "purpose": getattr(args, "purpose", "watertight"),
+        "stitch_tolerance": getattr(args, "stitch_tolerance", 0.),
+        "repair_timeout_seconds": getattr(args, "repair_timeout_seconds", None),
+        "cfd_max_edge_length": getattr(args, "cfd_max_edge_length", None),
+        "cfd_max_output_faces": getattr(args, "cfd_max_output_faces", 2_000_000),
         "visibility_grid": args.visibility_grid,
         "visibility_min_views": getattr(args, "visibility_min_views", 1),
         "outside_flood_grid": getattr(args, "outside_flood_grid", None),
@@ -228,6 +249,9 @@ def parameters_report(args: Any) -> dict[str, Any]:
         "voxel_pitch_bbox_max_extent": getattr(args, "voxel_pitch_bbox_max_extent", None),
         "sdf_band_voxels": getattr(args, "sdf_band_voxels", None),
         "sdf_smoothing_sigma": getattr(args, "sdf_smoothing_sigma", None),
+        "scaffold_smoothing_iterations": getattr(args, "scaffold_smoothing_iterations", 0),
+        "cross_component_jump_ratio": getattr(args, "cross_component_jump_ratio", None),
+        "projection_target": str(args.projection_target) if getattr(args, "projection_target", None) else None,
         "max_sdf_memory_gb": getattr(args, "max_sdf_memory_gb", None),
         "remove_name_regex": args.remove_name_regex,
         "policy_decisions": str(args.policy_decisions) if args.policy_decisions else None,
@@ -238,9 +262,10 @@ def parameters_report(args: Any) -> dict[str, Any]:
 
 def limitations(group_filter: dict[str, Any] | None) -> list[str]:
     result = [
-        "The watertight-shell target seals every opening; semantic evidence cannot weaken geometry gates.",
+        "Watertight material boundaries may retain genuine through-passages. Sub-resolution openings can close during voxel reconstruction and require separate semantic aperture validation.",
         "A sealed voxel shell is partitioned by six-connected far-field flood before marching cubes supplies immutable watertight connectivity and proxy fallback positions.",
         "Only correspondence-safe vertices are placed on source triangles; every rejected match retains its certified proxy position with a reason code.",
+        "Certified closed source shells are retained unchanged. Reconstruction currently selects whole remaining surface components, not minimal defect patches inside coupled shells.",
         "The source-projected candidate must survive serialized readback and exact all-face self-intersection certification.",
     ]
     if group_filter:
@@ -253,3 +278,36 @@ def limitations(group_filter: dict[str, Any] | None) -> list[str]:
             "Stage 1 uses mesh-only multi-view outermost visibility instead of group hide/show.",
         ])
     return result
+
+
+def record_cfd_refinement(report: dict[str, Any], refinement: dict[str, Any]) -> None:
+    """Own final-path selection after the optional CFD stage; keep accepted shell truth separate."""
+    shell_path = report["outputs"]["accepted_mesh_vtp"]
+    refined_path = refinement["outputs"]["cfd_surface_candidate_vtp"]
+    report["cfd_surface_refinement"] = refinement
+    report["stages"]["source_projected_watertight_candidate"]["accepted_final_geometry"] = False
+    report["stages"]["cfd_refined_surface"] = refinement["stages"]["cfd_refined_surface"]
+    report["gates"].update({f"cfd_{name}": value for name, value in refinement["gates"].items()})
+    decision = build_decision(report["gates"], refined_path)
+    report["outputs"] = accepted_outputs(report["outputs"], decision, refined_path, refined_path, source_fallback_path=shell_path)
+    report["outputs"]["watertight_mesh_vtp"] = shell_path
+    report["outputs"]["cfd_surface_candidate_vtp"] = refined_path
+    report["outputs"]["mesh_result"]["engineering_ready"] = False
+    if decision["status"] == "rejected":
+        report["outputs"]["mesh_result"].update(
+            role="accepted_watertight_fallback",
+            warning="CFD surface criteria failed; the fallback is an accepted watertight shell, not a CFD-qualified surface.",
+        )
+        report["ignored_outputs"].append({"path": refined_path, "kind": "rejected_cfd_surface", "reason": "CFD refinement gates failed", "safe_for_acceptance": False})
+    report["decision"] = {**decision, "outcome": report["outputs"]["mesh_result"]["status"], "source_fallback_path": report["outputs"].get("source_fallback_vtp")}
+    report["output_contract"]["accepted_final_rule"] = "decision.final_output_path == outputs.accepted_mesh_vtp == outputs.cfd_surface_candidate_vtp; watertight_mesh_vtp retains the accepted pre-refinement shell"
+    report["output_contract"]["rejected_result_rule"] = "CFD rejection retains the accepted watertight_mesh_vtp as fallback; this does not qualify it as a CFD surface"
+    report["input_truth"]["derived_artifacts"].append(refined_path)
+    metrics = refinement["stages"]["cfd_refined_surface"]["metrics"]
+    repair = report["repair_report"]
+    repair["geometry_to_mesh_trace"].append(trace_row("cfd_refined_surface", metrics, refinement["method"]))
+    repair["change_summary"]["source_projected_watertight_shell"]["accepted_final_geometry"] = False
+    repair["change_summary"]["cfd_refinement"] = {"parameters": refinement["parameters"], "accepted_final_geometry": decision["status"] == "accepted", "source": shell_path}
+    repair["defect_matrix"]["cfd_refined_surface"] = topology_snapshot(metrics)
+    repair["requested_capabilities"]["cfd_surface_refinement"] = {"checked": True, "passed": decision["status"] == "accepted", "volume_mesh_validated": False}
+    report["limitations"].extend(refinement["limitations"])

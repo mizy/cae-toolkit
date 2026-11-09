@@ -5,7 +5,7 @@ from typing import Any
 import numpy as np
 import pyvista as pv
 
-from mesh_io import read_surface, triangle_faces
+from mesh_io import read_surface, same_oriented_geometry, triangle_faces
 from mesh_metrics import mesh_report
 from source_projected_closure import REJECTION_BITS, rollback_reported_self_intersections
 
@@ -58,7 +58,12 @@ def exact_self_intersection_report(
         "intersection_pairs": int(pairs.shape[0]),
         "reported_pairs": reported.tolist(),
         "reported_pair_limit": int(max_reported_pairs),
-        "reported_pairs_truncated": bool(reported.shape[0] < pairs.shape[0]),
+        # A positive first-only result is evidence of intersections, not a full pair inventory.
+        # Hitting the caller's limit is also treated as incomplete because CGAL may stop there.
+        "reported_pairs_truncated": bool(pairs.shape[0] > 0 and
+                                          (first_only or pairs.shape[0] >= max_reported_pairs)),
+        "intersection_pairs_is_lower_bound": bool(pairs.shape[0] > 0 and
+                                                    (first_only or pairs.shape[0] >= max_reported_pairs)),
         "slow_and_more_precise_rounding": True,
         "failure_reason": None if pairs.shape[0] == 0 else "exact intersecting face pairs found",
     }
@@ -249,6 +254,7 @@ def roundtrip_validation(
         normalized_points.shape[0] == expected_points.shape[0]
         and normalized_faces.shape == expected_faces.shape
         and normalized_passed
+        and same_oriented_geometry(raw, normalized)
     )
     passed = raw_exact and raw_passed and topology_survived_clean
     return {

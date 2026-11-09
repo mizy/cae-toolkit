@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pyvista as pv
 
-from mesh_io import read_surface, triangle_faces
+from mesh_io import triangle_faces
 
 
 VTK_JS_UNAVAILABLE_STUB = (
@@ -21,17 +22,37 @@ def mesh_previews(report: dict[str, Any], report_dir: Path) -> list[dict[str, An
     specs = preview_specs(report)
     previews = []
     for label, raw_path in specs:
+        if not raw_path:
+            continue
         path = resolve_path(raw_path, report_dir)
         if path and path.exists():
             try:
                 previews.append(mesh_preview(label, path))
             except Exception as exc:
                 previews.append({"label": label, "source": str(path), "error": str(exc), "points": [], "polys": []})
-    return [preview for preview in previews if preview.get("points") and preview.get("polys")]
+        else:
+            previews.append({"label": label, "source": str(path), "error": "mesh file is missing", "points": [], "polys": []})
+    if previews and (report.get("target", {}).get("purpose") == "print"
+                     or report.get("target", {}).get("name") == "watertight-material"):
+        regions = report.get("unresolved_policy_packet", {}).get("items", [])
+        if previews[0].get("full_resolution"):
+            previews[0]["regions"] = regions
+        elif regions:
+            previews[0]["opening_review_unavailable"] = "Opening review requires a full-resolution source view; decimated face IDs cannot identify source regions."
+        for preview in previews:
+            preview["minimum_wall_mm"] = report.get("parameters", {}).get("print_min_wall_mm")
+    return previews
 
 
 def preview_specs(report: dict[str, Any]) -> list[tuple[str, str | None]]:
     outputs = report.get("outputs", {})
+    if outputs.get("mesh_previews"):
+        return [(item["label"], item["path"]) for item in outputs["mesh_previews"]]
+    if outputs.get("cfd_surface_candidate_vtp"):
+        return [
+            ("Accepted watertight input", outputs.get("watertight_mesh_vtp")),
+            ("Accepted CFD surface refinement" if outputs.get("accepted_mesh_vtp") else "Rejected CFD surface candidate", outputs["cfd_surface_candidate_vtp"]),
+        ]
     original_comparison = outputs.get("original_mesh_vtp")
     processed_comparison = outputs.get("processed_mesh_vtp")
     if original_comparison and processed_comparison:
@@ -66,6 +87,8 @@ def preview_specs(report: dict[str, Any]) -> list[tuple[str, str | None]]:
         return [("Diagnostic closure proxy", proxy)]
     if refined := outputs.get("adaptive_refined_source_vtp"):
         return [("Original input", input_path(report)), ("Adaptive refined source", refined)]
+    if candidate := outputs.get(SOURCE_PROJECTED_OUTPUT_KEY) or outputs.get("rejected_candidate_vtp"):
+        return [("Source exterior", stage1), ("Unaccepted candidate — diagnostic only", candidate)]
     return []
 
 
@@ -91,19 +114,59 @@ def resolve_path(raw_path: str | None, report_dir: Path) -> Path | None:
 
 
 def mesh_preview(label: str, path: Path) -> dict[str, Any]:
-    mesh = read_surface(path)
-    original_triangles = int(mesh.n_cells)
-    viewer_triangle_limit = viewer_triangle_limit_from_env()
-    if viewer_triangle_limit and mesh.n_cells > viewer_triangle_limit:
-        reduction = 1.0 - (viewer_triangle_limit / float(mesh.n_cells))
-        mesh = mesh.decimate_pro(reduction, preserve_topology=False).triangulate().clean()
+    # Preview source defects too: cleaning can collapse degenerate faces to lines.
+    if path.suffix.lower() in (".glb", ".gltf"):
+        from gltf_surface import read_gltf_surface
+        mesh = read_gltf_surface(path)
+    else:
+        mesh = pv.read(path)
+    if isinstance(mesh, pv.MultiBlock):
+        mesh = mesh.combine()
+    if not isinstance(mesh, pv.PolyData):
+        mesh = mesh.extract_surface()
+    mesh = mesh.triangulate()
     faces = triangle_faces(mesh)
+    original_triangles = int(faces.shape[0])
+    viewer_triangle_limit = viewer_triangle_limit_from_env()
+    if viewer_triangle_limit and original_triangles > viewer_triangle_limit:
+        reduction = 1.0 - (viewer_triangle_limit / float(original_triangles))
+        mesh = mesh.decimate_pro(reduction, preserve_topology=False).triangulate().clean()
+        faces = triangle_faces(mesh)
     polys = np.column_stack((np.full((faces.shape[0], 1), 3, dtype=np.uint32), faces)).ravel()
     points = np.asarray(mesh.points, dtype=np.float32)
     displayed_triangles = int(faces.shape[0])
+    fields = {
+        name: np.nan_to_num(np.asarray(mesh.cell_data[name], dtype=float), nan=-1, posinf=-1, neginf=-1).tolist()
+        for name in ("print_generated_face", "print_source_distance_mm", "print_thickness_mm")
+        if name in mesh.cell_data and len(mesh.cell_data[name]) == displayed_triangles
+    }
+    if "source_projected_vertex_fraction" in mesh.cell_data:
+        fraction = np.asarray(mesh.cell_data["source_projected_vertex_fraction"], dtype=float).reshape(-1)
+        if fraction.size == displayed_triangles:
+            fields["projection_fallback_fraction"] = np.where(np.isfinite(fraction), 1. - np.clip(fraction, 0., 1.), -1.).tolist()
+    normals = np.asarray(mesh.point_data["Normals"], dtype=float) if "Normals" in mesh.point_data else None
+    geometry_normals = None
+    if "corner_normals" in mesh.cell_data:
+        corner_normals = np.asarray(mesh.cell_data["corner_normals"], dtype=float)
+        if corner_normals.shape != (displayed_triangles, 9) or not np.all(np.isfinite(corner_normals)):
+            raise ValueError("corner_normals must contain three finite normals per triangle")
+        # Split display vertices only at normal seams; keep triangle IDs and physical VTP intact.
+        geometric = mesh.compute_normals(cell_normals=False, split_vertices=False)
+        vertex_ids = faces.ravel()
+        corner_normals = np.round(corner_normals.reshape(-1, 3), 6)
+        keys = np.column_stack((vertex_ids, corner_normals))
+        _, first, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
+        display_ids = vertex_ids[first]
+        geometry_normals = np.asarray(geometric.point_data["Normals"])[display_ids]
+        points = points[display_ids]
+        normals = corner_normals[first]
+        polys = np.column_stack((np.full(displayed_triangles, 3), inverse.reshape(-1, 3))).ravel()
+    valid_normals = normals is not None and normals.shape == points.shape and np.all(np.isfinite(normals))
     return {
         "label": label,
         "source": str(path),
+        "normals": np.round(normals, 6).tolist() if valid_normals else None,
+        "geometry_normals": np.round(geometry_normals, 6).tolist() if geometry_normals is not None else None,
         "points": np.round(points, 6).tolist(),
         "polys": polys.astype(np.uint32).tolist(),
         "triangles": displayed_triangles,
@@ -114,6 +177,7 @@ def mesh_preview(label: str, path: Path) -> dict[str, Any]:
         "points_count": int(points.shape[0]),
         "proxy_weights": proxy_weight_values(mesh, displayed_triangles),
         "issue_values": issue_values(mesh, displayed_triangles),
+        "fields": fields,
     }
 
 
@@ -151,13 +215,18 @@ def issue_values(mesh: Any, cell_count: int) -> list[float]:
 
 def vtk_js_source() -> str:
     env_path = os.environ.get("VTK_JS_PATH")
-    if not env_path:
-        return VTK_JS_UNAVAILABLE_STUB
-    path = Path(env_path)
+    path = Path(env_path) if env_path else Path(__file__).resolve().parents[1] / "assets/vtk-32.12.0/vtk.js"
     if not path.is_file():
         return VTK_JS_UNAVAILABLE_STUB
     try:
-        return path.read_text(encoding="utf-8")
+        source = path.read_text(encoding="utf-8")
+        if not env_path:
+            notices = "\n".join(
+                (path.parent / name).read_text(encoding="utf-8")
+                for name in ("LICENSE", "Copyright.txt", "vtk.js.LICENSE.txt")
+            )
+            source = "/*\n" + notices.replace("*/", "* /") + "\n*/\n" + source
+        return source
     except (OSError, UnicodeError):
         return VTK_JS_UNAVAILABLE_STUB
 
@@ -182,72 +251,4 @@ def script_json(value: Any) -> str:
 
 
 def viewer_js() -> str:
-    return """
-(function () {
-  const raw = document.getElementById('mesh-preview-data');
-  if (!raw || typeof vtk === 'undefined') {
-    document.querySelectorAll('.vtk-viewer').forEach((container) => {
-      container.textContent = 'vtk.js failed to load';
-    });
-    return;
-  }
-  const meshes = JSON.parse(raw.textContent);
-  const vtkGenericRenderWindow = vtk.Rendering.Misc.vtkGenericRenderWindow;
-  const vtkActor = vtk.Rendering.Core.vtkActor;
-  const vtkMapper = vtk.Rendering.Core.vtkMapper;
-  const vtkPolyData = vtk.Common.DataModel.vtkPolyData;
-  const vtkDataArray = vtk.Common && vtk.Common.Core && vtk.Common.Core.vtkDataArray;
-  const vtkColorTransferFunction = vtk.Rendering.Core.vtkColorTransferFunction;
-
-  meshes.forEach((mesh, index) => {
-    const container = document.getElementById(`vtk-viewer-${index}`);
-    if (!container) return;
-    const generic = vtkGenericRenderWindow.newInstance({ background: [0.98, 0.99, 1.0] });
-    generic.setContainer(container);
-    generic.resize();
-    const polyData = vtkPolyData.newInstance();
-    polyData.getPoints().setData(Float32Array.from(mesh.points.flat()), 3);
-    polyData.getPolys().setData(Uint32Array.from(mesh.polys));
-    const mapper = vtkMapper.newInstance();
-    mapper.setInputData(polyData);
-    const actor = vtkActor.newInstance();
-    actor.setMapper(mapper);
-    if (mesh.issue_values && mesh.issue_values.length === mesh.triangles && vtkDataArray && vtkColorTransferFunction) {
-      const scalars = vtkDataArray.newInstance({
-        name: 'watertight_issue',
-        numberOfComponents: 1,
-        values: Float32Array.from(mesh.issue_values),
-      });
-      polyData.getCellData().setScalars(scalars);
-      const lookup = vtkColorTransferFunction.newInstance();
-      lookup.addRGBPoint(0.0, 0.55, 0.62, 0.70);
-      lookup.addRGBPoint(1.0, 0.96, 0.26, 0.12);
-      mapper.setLookupTable(lookup);
-      if (mapper.setScalarModeToUseCellData) mapper.setScalarModeToUseCellData();
-      if (mapper.setColorByArrayName) mapper.setColorByArrayName('watertight_issue');
-      if (mapper.setScalarRange) mapper.setScalarRange(0, 1);
-    } else if (mesh.proxy_weights && mesh.proxy_weights.length === mesh.triangles && vtkDataArray && vtkColorTransferFunction) {
-      const scalars = vtkDataArray.newInstance({
-        name: 'proxy_weight',
-        numberOfComponents: 1,
-        values: Float32Array.from(mesh.proxy_weights),
-      });
-      polyData.getCellData().setScalars(scalars);
-      const lookup = vtkColorTransferFunction.newInstance();
-      lookup.addRGBPoint(0.0, 0.22, 0.58, 0.82);
-      lookup.addRGBPoint(0.5, 0.95, 0.70, 0.18);
-      lookup.addRGBPoint(1.0, 0.88, 0.24, 0.16);
-      mapper.setLookupTable(lookup);
-      if (mapper.setScalarModeToUseCellData) mapper.setScalarModeToUseCellData();
-      if (mapper.setColorByArrayName) mapper.setColorByArrayName('proxy_weight');
-      if (mapper.setScalarRange) mapper.setScalarRange(0, 1);
-    } else {
-      actor.getProperty().setColor(index === 0 ? 0.55 : 0.2, index === 0 ? 0.62 : 0.7, index === 0 ? 0.7 : 0.35);
-    }
-    actor.getProperty().setOpacity(1.0);
-    generic.getRenderer().addActor(actor);
-    generic.getRenderer().resetCamera();
-    generic.getRenderWindow().render();
-  });
-})();
-"""
+    return Path(__file__).with_name("html_mesh_viewer.js").read_text(encoding="utf-8")

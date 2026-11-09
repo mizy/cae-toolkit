@@ -79,6 +79,21 @@ def face_component_labels(
     return labels.astype(np.int64, copy=False)
 
 
+def component_face_rows(labels: np.ndarray) -> list[np.ndarray]:
+    """Group dense face-component labels in one stable sort, not one scan per component."""
+    labels = np.asarray(labels, dtype=np.int64)
+    if labels.ndim != 1:
+        raise ValueError("component labels must be one-dimensional")
+    if not labels.size:
+        return []
+    if np.any(labels < 0):
+        raise ValueError("component labels must be nonnegative")
+    order = np.argsort(labels, kind="stable")
+    sorted_labels = labels[order]
+    starts = np.r_[0, np.flatnonzero(sorted_labels[1:] != sorted_labels[:-1]) + 1]
+    return [rows for rows in np.split(order, starts[1:])]
+
+
 def inconsistent_winding_edges(faces: np.ndarray) -> int:
     """Count manifold edges whose two incident faces traverse the edge in the same direction."""
     directions: dict[tuple[int, int], list[int]] = {}
@@ -124,22 +139,39 @@ def triangle_quality(points: np.ndarray, faces: np.ndarray) -> dict[str, Any]:
     areas = np.linalg.norm(cross, axis=1) * 0.5
     max_edge = np.maximum.reduce([e0, e1, e2])
     min_edge = np.minimum.reduce([e0, e1, e2])
-    min_alt = np.divide(
-        2.0 * areas, max_edge, out=np.zeros_like(areas), where=max_edge > 1e-15
-    )
+    min_alt = np.divide(2.0 * areas, max_edge, out=np.zeros_like(areas), where=max_edge > 0)
     aspect = np.divide(
-        max_edge, min_alt, out=np.full_like(max_edge, np.inf), where=min_alt > 1e-15
+        max_edge, min_alt, out=np.full_like(max_edge, np.inf), where=min_alt > 0
     )
     finite_aspect = aspect[np.isfinite(aspect)]
-    eps_area = max(float(np.nanmedian(areas)) * 1e-12, 1e-18)
+    area_error = triangle_area_error_bound(points, faces)
     return {
         "surface_area": float(areas.sum()),
         "degenerate_faces": int(
-            np.count_nonzero((areas <= eps_area) | (min_edge <= 1e-15))
+            np.count_nonzero(areas <= area_error)
         ),
+        "area_error_bound_max": float(area_error.max(initial=0.0)),
         "area": percentile_summary(areas),
         "aspect_ratio": percentile_summary(finite_aspect),
     }
+
+
+def triangle_area_error_bound(points: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """Estimate area roundoff from coordinate subtraction and cross products."""
+    triangles = np.asarray(points, dtype=np.float64)[np.asarray(faces, dtype=np.int64)]
+    if not len(triangles):
+        return np.empty(0, dtype=np.float64)
+    base = triangles[:, 0]
+    edge_a = triangles[:, 1] - base
+    edge_b = triangles[:, 2] - base
+    length_a = np.linalg.norm(edge_a, axis=1)
+    length_b = np.linalg.norm(edge_b, axis=1)
+    eps = np.finfo(np.float64).eps
+    error_a = eps * np.linalg.norm(np.abs(triangles[:, 1]) + np.abs(base), axis=1)
+    error_b = eps * np.linalg.norm(np.abs(triangles[:, 2]) + np.abs(base), axis=1)
+    subtraction_error = error_a * length_b + error_b * length_a + error_a * error_b
+    operation_gamma = (16 * eps) / (1 - 16 * eps)
+    return (subtraction_error + operation_gamma * length_a * length_b) * 0.5
 
 
 def bounds_dict(points: np.ndarray) -> dict[str, Any]:
@@ -158,10 +190,53 @@ def bounds_dict(points: np.ndarray) -> dict[str, Any]:
 
 def signed_volume(points: np.ndarray, faces: np.ndarray) -> float:
     triangles = points[faces]
+    if not len(triangles):
+        return 0.0
+    # Closed-surface volume is translation invariant; a local origin avoids cancellation.
+    triangles = triangles - triangles[0, 0]
     volume = np.einsum(
         "ij,ij->i", triangles[:, 0], np.cross(triangles[:, 1], triangles[:, 2])
     ).sum()
     return float(volume / 6.0)
+
+
+def signed_volume_error_bound(points: np.ndarray, faces: np.ndarray) -> float:
+    """Estimate a conservative roundoff scale for the translated volume sum.
+
+    This floating-point estimate is a numerical reliability threshold, not an
+    exact-arithmetic certificate.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    triangles = points[np.asarray(faces, dtype=np.int64)]
+    if not len(triangles):
+        return 0.0
+    origin = triangles[0, 0]
+    relative = triangles - origin
+    lengths = np.linalg.norm(relative, axis=2)
+    a, b, c = relative[:, 0], relative[:, 1], relative[:, 2]
+    la, lb, lc = lengths[:, 0], lengths[:, 1], lengths[:, 2]
+    unit_roundoff = np.finfo(np.float64).eps
+
+    # Include coordinate subtraction error, determinant arithmetic, and summation.
+    coordinate_error = unit_roundoff * np.linalg.norm(
+        np.abs(triangles) + np.abs(origin), axis=2
+    )
+    da, db, dc = coordinate_error[:, 0], coordinate_error[:, 1], coordinate_error[:, 2]
+    perturbation = (
+        da * lb * lc + db * la * lc + dc * la * lb
+        + da * db * lc + da * dc * lb + db * dc * la + da * db * dc
+    )
+    products = la * lb * lc
+    determinants = np.einsum("ij,ij->i", a, np.cross(b, c))
+    operation_gamma = (32 * unit_roundoff) / (1 - 32 * unit_roundoff)
+    summation_steps = max(len(triangles) - 1, 0)
+    summation_gamma = (summation_steps * unit_roundoff) / (1 - summation_steps * unit_roundoff)
+    absolute_sum = np.abs(determinants).sum()
+    return float((
+        perturbation.sum()
+        + operation_gamma * products.sum()
+        + (summation_gamma + unit_roundoff) * absolute_sum
+    ) / 6.0)
 
 
 def component_volume_report(
@@ -174,24 +249,14 @@ def component_volume_report(
     winding_errors: int,
 ) -> dict[str, Any]:
     labels = face_component_labels(faces.shape[0], edge_to_faces)
-    signed_components = (
-        [
-            signed_volume(points, faces[labels == component_id])
-            for component_id in range(int(labels.max()) + 1)
-        ]
-        if labels.size
-        else []
-    )
-    scale = (
-        float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
-        if points.size
-        else 0.0
-    )
-    volume_epsilon = max(scale**3 * 1e-15, 1e-30)
+    component_rows = component_face_rows(labels)
+    signed_components = [signed_volume(points, faces[rows]) for rows in component_rows]
+    error_bounds = [signed_volume_error_bound(points, faces[rows]) for rows in component_rows]
+    resolved = [abs(value) > error for value, error in zip(signed_components, error_bounds)]
     nonzero_signs = [
         int(np.sign(value))
-        for value in signed_components
-        if abs(value) > volume_epsilon
+        for value, is_resolved in zip(signed_components, resolved)
+        if is_resolved
     ]
     orientation_consistent = bool(
         winding_errors == 0
@@ -215,13 +280,15 @@ def component_volume_report(
         else None,
         "signed_sum": float(sum(signed_components)) if reliable else None,
         "component_signed": [float(value) for value in signed_components],
+        "component_signed_error_bound": [float(value) for value in error_bounds],
         "component_count": len(signed_components),
         "orientation_consistent": orientation_consistent,
     }
 
 
-def mesh_report(points: np.ndarray, faces: np.ndarray) -> dict[str, Any]:
-    topology, edge_to_faces = edge_topology(faces)
+def mesh_report(points: np.ndarray, faces: np.ndarray, *, edge_data=None) -> dict[str, Any]:
+    """Compute metrics; supplied edge data must be built from these exact faces."""
+    topology, edge_to_faces = edge_topology(faces) if edge_data is None else edge_data
     quality = triangle_quality(points, faces)
     components = connected_components(faces.shape[0], edge_to_faces)
     winding_errors = inconsistent_winding_edges(faces)

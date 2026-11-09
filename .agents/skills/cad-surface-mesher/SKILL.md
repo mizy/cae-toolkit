@@ -14,6 +14,13 @@ in a mesh-watertight-repair CLI. The command-line tools are deterministic worker
 
 All commands below assume the working directory is this skill directory (`.agents/skills/cad-surface-mesher/`).
 
+Before any geometry-changing repair, establish whether the requested result is for CFD or 3D
+printing using the user's stated intent and conversation. If the purpose is unspecified, inspect
+the source and ask; do not silently select external flow. Geometry-only closure remains available
+when explicitly requested. For CFD establish the fluid domain and required openings; for printing
+establish the material, functional openings, units or scale and print constraints. Follow the
+sibling [`mesh-watertight-repair`](../mesh-watertight-repair/SKILL.md) intent and acceptance rules.
+
 For the combined dirty-STL workflow:
 
 1. Invoke the mesh-watertight-repair two-stage worker for one deterministic geometry round. It
@@ -42,7 +49,20 @@ python ../mesh-watertight-repair/scripts/two_stage_watertight_remesh.py INPUT \
 
 The Skill agent owns the semantic loop; the worker owns deterministic geometry and validation.
 
-Create a target-specific CAD surface mesh, not a faithful full assembly mesh. The common default target is an exterior flow or analysis skin for CAX/CAE preprocessing with explicit visibility, visual, and topology evidence. Vehicles are only one target family.
+For CFD requests, add `--purpose cfd --cfd-max-edge-length LENGTH` to the worker. Choose `LENGTH`
+in verified input coordinate units. This optional postprocessing uses original-source feature
+sizing, conforming subdivision, and bounded projection of new points after shell acceptance.
+Plain watertight requests keep the default path and do not pay this refinement cost. Check the
+separate CFD gates and retained `watertight_mesh_vtp`; surface refinement does not establish
+opening policy, shape fidelity, boundary-layer or volume-mesh acceptance.
+
+For 3D printing use the same worker with `--purpose print`, explicit input units or final size,
+and printer-specific wall/error thresholds. This purpose branches before exterior-only filtering,
+retains native through-holes, material cavities and separate pieces, and executes reviewed caps or
+explicit wall/Boolean construction. Read the sibling Skill's print-purpose contract. Require STL/3MF
+readback and layer contours; do not equate accepted geometry with configured machine-toolpath readiness.
+
+Create a surface mesh for the confirmed target, with explicit visibility, visual, and topology evidence. Exterior-flow skins and printable material meshes have different opening and interior requirements. Vehicles are only one target family.
 
 ## Core Rule
 
@@ -296,7 +316,9 @@ Every completed meshing or repair run must write an HTML report alongside mesh o
 
 For a multi-step run, the primary user-facing artifact is one single-file HTML workflow report. Stage-specific HTML/JSON reports may exist as intermediate debug artifacts, but do not present them as separate final reports unless the user asks for stage details.
 
-HTML 3D previews may decimate only for browser/report size. Keep source metrics and output mesh files full fidelity. When visual fidelity matters, raise `CAD_SURFACE_MESHER_VIEWER_TRIANGLES` for report generation and state the preview triangle count in the report.
+Deliver an interactive 3D HTML report using the sibling `mesh-watertight-repair/scripts/html_report.py:write_html_report` entrypoint. Embed model data and the bundled renderer for offline rotation, zoom, mesh-edge display, opacity, and stage comparison. Populate `outputs.mesh_previews` with `{label, path}` entries when the workflow needs a curated original/cleanup/closure/CFD comparison; preserve each candidate's acceptance status in its label. Static screenshots supplement this 3D report.
+
+HTML 3D previews embed full-resolution geometry by default. Decimate only through an explicit `CAD_SURFACE_MESHER_VIEWER_TRIANGLES` limit for browser/report size; state the preview triangle count. Keep source metrics and output mesh files full fidelity.
 
 Required sections:
 

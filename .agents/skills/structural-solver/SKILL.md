@@ -6,6 +6,9 @@ description: Linear static structural analysis (stiffness k = F/delta) with defo
 # Structural Solver
 
 Linear static elasticity (small strain, isotropic material) for parametric part geometry.
+For the experimental browser WebGPU solver and its example, see
+[`web/README.md`](web/README.md). It solves an exported FEM system and is not a
+replacement for the native workflow.
 The solver is self-contained: gmsh builds box meshes, the hinge uses a deterministic
 numpy mesher (gmsh OCC boolean meshing of knuckle cylinders hangs, so the hinge avoids it),
 rendering uses pyvista offscreen.

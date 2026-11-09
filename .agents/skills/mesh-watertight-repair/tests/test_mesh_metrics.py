@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest.mock import patch
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,6 +56,15 @@ def tetrahedron(offset: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
 
 
 class MeshMetricsTest(unittest.TestCase):
+    def test_precomputed_edge_topology_preserves_complete_metrics(self) -> None:
+        import mesh_metrics
+        points, faces = tetrahedron()
+        expected = mesh_report(points, faces)
+        edge_data = mesh_metrics.edge_topology(faces)
+        with patch("mesh_metrics.edge_topology", side_effect=AssertionError("unexpected recomputation")):
+            actual = mesh_report(points, faces, edge_data=edge_data)
+        self.assertEqual(actual, expected)
+
     def test_identical_meshes_have_zero_silhouette_drift(self) -> None:
         points, faces = square_mesh()
         report = silhouette_drift_from_meshes(

@@ -33,6 +33,9 @@ def output_artifact_paths(output_dir: Path) -> list[Path]:
         output_dir / "source_preserving_candidate.vtp",
         output_dir / "closure_proxy.vtp",
         output_dir / "source_projected_watertight_candidate.vtp",
+        output_dir / "source_material_candidate.vtp",
+        output_dir / "source_material_report.json",
+        output_dir / "source_material_report.html",
         output_dir / "source_projection_report.json",
         output_dir / "ai_policy_packet.json",
         output_dir / "two_stage_report.json",
@@ -41,6 +44,12 @@ def output_artifact_paths(output_dir: Path) -> list[Path]:
         output_dir / "visual",
         output_dir / "debug",
         output_dir / "opening_policy_evidence",
+        output_dir / "opening_transactions.json",
+        output_dir / "cfd",
+        *[output_dir / name for name in (
+            "print_source_mm.vtp", "print_candidate.vtp", "print_candidate.stl", "print_candidate.3mf",
+            "print_candidate.gcode", "print_report.json", "print_report.html", "print_layers.json", "slicer.log",
+        )],
     ]
     paths.extend(output_dir.glob(".run_status.json.*.tmp"))
     return paths

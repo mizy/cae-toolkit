@@ -7,3 +7,5 @@ scikit-image
 scipy
 vtk
 trimesh
+manifold3d==3.5.2
+lxml

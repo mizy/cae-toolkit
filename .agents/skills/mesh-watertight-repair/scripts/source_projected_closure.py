@@ -19,6 +19,7 @@ REJECTION_BITS = {
     "projected_vertex_collision": 128,
     "triangle_quality_rollback": 256,
     "reported_self_intersection_rollback": 512,
+    "fixed_input_vertex": 1024,
 }
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class ProjectionThresholds:
     max_edge_length_ratio: float = 4.0
     max_quality_rollback_iterations: int = 6
     require_component_consistency: bool = True
+    cross_component_jump_ratio: float | None = None
 
 def _validate_mesh(name: str, points: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     points = np.asarray(points, dtype=np.float64)
@@ -112,9 +114,9 @@ def _closest_source_points(
     source_faces: np.ndarray,
     query_points: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # PyVista dispatches this batch query through VTK's static cell locator in
-    # compiled code.  It is equivalent to calling FindClosestPoint for every
-    # vertex, but avoids a Python callback for each proxy point.
+    # VTK owns the triangle locator; PyVista's array interface currently loops
+    # over query points in Python. Keep the nearest face IDs as well as positions
+    # because correspondence gates and provenance depend on both.
     import pyvista as pv
 
     packed = np.empty((source_faces.shape[0], 4), dtype=np.int64)
@@ -176,18 +178,32 @@ def _orientation_gate(
     return rejected, component_votes
 
 def _component_consistency_rejections(
+    proxy_points: np.ndarray,
     proxy_faces: np.ndarray,
+    closest: np.ndarray,
     source_components: np.ndarray,
     accepted: np.ndarray,
+    max_jump_ratio: float | None,
 ) -> tuple[np.ndarray, int]:
+    # Separate source panels may meet smoothly. Check the change in projection
+    # displacement across their seam instead of treating every component ID as a wall.
+    if max_jump_ratio is not None and (not np.isfinite(max_jump_ratio) or max_jump_ratio <= 0):
+        raise ValueError("cross_component_jump_ratio must be finite and positive")
+    inconsistent = np.zeros(proxy_faces.shape[0], dtype=bool)
+    displacement = closest - proxy_points if max_jump_ratio is not None else None
+    for left, right in ((0, 1), (1, 2), (2, 0)):
+        a, b = proxy_faces[:, left], proxy_faces[:, right]
+        crossing = accepted[a] & accepted[b] & (source_components[a] != source_components[b])
+        if displacement is not None:
+            ids = np.flatnonzero(crossing)
+            lengths = np.linalg.norm(proxy_points[a[ids]] - proxy_points[b[ids]], axis=1)
+            jumps = np.linalg.norm(displacement[a[ids]] - displacement[b[ids]], axis=1)
+            crossing[ids] = jumps > max_jump_ratio * lengths
+        inconsistent |= crossing
     rejected = np.zeros(accepted.shape[0], dtype=bool)
-    inconsistent_faces = 0
-    for face in proxy_faces:
-        ids = face[accepted[face]]
-        if ids.size >= 2 and np.unique(source_components[ids]).size > 1:
-            rejected[ids] = True
-            inconsistent_faces += 1
-    return rejected, inconsistent_faces
+    rejected[proxy_faces[inconsistent].ravel()] = True
+    rejected &= accepted
+    return rejected, int(np.count_nonzero(inconsistent))
 
 def _collision_rejections(
     candidate_points: np.ndarray,
@@ -386,30 +402,48 @@ def _build_report(
 def _project_with_gates(
     proxy_points: np.ndarray, proxy_faces: np.ndarray, source_points: np.ndarray, source_faces: np.ndarray,
     thresholds: ProjectionThresholds, reliable_source_face_mask: np.ndarray | None,
+    movable_vertex_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any], dict[str, Any]]:
     scale = float(np.linalg.norm(np.ptp(source_points, axis=0)))
     max_distance = thresholds.max_projection_distance
     if max_distance is None:
         max_distance = max(scale * thresholds.max_distance_bbox_ratio, 1e-15)
     source_components, defect_edges, degenerate, source_topology = _source_topology(source_points, source_faces)
-    closest, face_ids, distances = _closest_source_points(source_points, source_faces, proxy_points)
+    reliable = np.ones(source_faces.shape[0], dtype=bool) if reliable_source_face_mask is None else np.asarray(reliable_source_face_mask, dtype=bool)
+    if reliable.shape != (source_faces.shape[0],):
+        raise ValueError("reliable_source_face_mask must contain one value per source face")
+    eligible = np.flatnonzero(reliable & ~degenerate)
+    # Search trusted exterior triangles directly. A nearer hidden face must not
+    # hide an eligible outer skin and force an otherwise valid point to the proxy.
+    query_faces = source_faces[eligible] if eligible.size else source_faces
+    closest, query_ids, distances = _closest_source_points(source_points, query_faces, proxy_points)
+    face_ids = eligible[query_ids] if eligible.size else query_ids
     target_components = source_components[face_ids]
     barycentric = _barycentric(closest, source_points[source_faces[face_ids]])
     source_normals, _ = _unit_face_normals(source_points, source_faces)
     raw_dot = np.einsum("ij,ij->i", _vertex_normals(proxy_points, proxy_faces), source_normals[face_ids])
     rejection = np.zeros(proxy_points.shape[0], dtype=np.uint16)
-    reliable = np.ones(source_faces.shape[0], dtype=bool) if reliable_source_face_mask is None else np.asarray(reliable_source_face_mask, dtype=bool)
-    if reliable.shape != (source_faces.shape[0],):
-        raise ValueError("reliable_source_face_mask must contain one value per source face")
+    if movable_vertex_mask is not None:
+        movable = np.asarray(movable_vertex_mask, dtype=bool)
+        if movable.shape != (proxy_points.shape[0],):
+            raise ValueError("movable_vertex_mask must contain one value per proxy vertex")
+        rejection[~movable] |= REJECTION_BITS["fixed_input_vertex"]
     rejection[~reliable[face_ids] | degenerate[face_ids]] |= REJECTION_BITS["source_face_unreliable"]
     rejection[distances > max_distance] |= REJECTION_BITS["distance_gate_failed"]
-    rejection[np.min(barycentric, axis=1) < thresholds.source_edge_barycentric_margin] |= REJECTION_BITS["source_edge_or_vertex_gate_failed"]
-    near_defect = np.any((barycentric < thresholds.defect_edge_barycentric_margin) & defect_edges[face_ids], axis=1)
-    rejection[near_defect] |= REJECTION_BITS["source_defect_edge_gate_failed"]
+    # A zero inset disables the gate. Closest-point edge coordinates can be
+    # slightly negative from roundoff even though VTK returned a point on the triangle.
+    if thresholds.source_edge_barycentric_margin > 0:
+        rejection[np.min(barycentric, axis=1) < thresholds.source_edge_barycentric_margin] |= REJECTION_BITS["source_edge_or_vertex_gate_failed"]
+    if thresholds.defect_edge_barycentric_margin > 0:
+        near_defect = np.any((barycentric < thresholds.defect_edge_barycentric_margin) & defect_edges[face_ids], axis=1)
+        rejection[near_defect] |= REJECTION_BITS["source_defect_edge_gate_failed"]
     normal_rejection, votes = _orientation_gate(raw_dot, target_components, rejection == 0, thresholds)
     rejection |= normal_rejection
     if thresholds.require_component_consistency:
-        mismatch, mismatch_faces = _component_consistency_rejections(proxy_faces, target_components, rejection == 0)
+        mismatch, mismatch_faces = _component_consistency_rejections(
+            proxy_points, proxy_faces, closest, target_components, rejection == 0,
+            thresholds.cross_component_jump_ratio,
+        )
         rejection[mismatch] |= REJECTION_BITS["source_component_spatial_mismatch"]
     else:
         mismatch_faces = 0
@@ -439,6 +473,11 @@ def _project_with_gates(
         if not np.any(new_collisions) and not np.any(quality_rollback):
             break
     gate_reports = {
+        "source_query": {
+            "method": "closest_reliable_source_triangle" if eligible.size else "no_eligible_source_faces",
+            "eligible_source_faces": int(eligible.size), "source_faces": int(source_faces.shape[0]),
+            "source_face_ids_preserved": True,
+        },
         "component_gate": {"source_component_votes": votes, "inconsistent_proxy_faces": mismatch_faces},
         "collision_gate": {"candidate_nonadjacent_pairs": collision_pairs, "rolled_back_vertices": int(np.count_nonzero(collisions))},
         "triangle_quality_rollback": {"iterations": iterations, "remaining_issue_faces": int(np.count_nonzero(_triangle_issue_mask(candidate, proxy_points, proxy_faces, thresholds)))},
@@ -456,15 +495,32 @@ def project_closure_to_source(
     *,
     thresholds: ProjectionThresholds | None = None,
     reliable_source_face_mask: np.ndarray | None = None,
+    movable_vertex_mask: np.ndarray | None = None,
+    preserved_vertex_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, dict[str, np.ndarray]], dict[str, Any]]:
     """Project trusted vertices exactly while preserving closure connectivity."""
     proxy_points, proxy_faces_i64 = _validate_mesh("proxy", proxy_points, proxy_faces)
     source_points, source_faces = _validate_mesh("source", source_points, source_faces)
     thresholds = thresholds or ProjectionThresholds()
+    preserved = np.zeros(len(proxy_points), dtype=bool) if preserved_vertex_mask is None else np.asarray(preserved_vertex_mask, dtype=bool)
+    if preserved.shape != (len(proxy_points),):
+        raise ValueError("preserved_vertex_mask must contain one value per proxy vertex")
+    if np.any(preserved):
+        if np.any((preserved[proxy_faces_i64].sum(axis=1) > 0) & (preserved[proxy_faces_i64].sum(axis=1) < 3)):
+            raise ValueError("preserved vertices must cover whole disconnected shells")
+        movable_vertex_mask = (~preserved if movable_vertex_mask is None
+                               else np.asarray(movable_vertex_mask, dtype=bool) & ~preserved)
     candidate, closest, face_ids, target_components, distances, raw_dot, rejection, gate_reports, resolved = _project_with_gates(
         proxy_points, proxy_faces_i64, source_points, source_faces, thresholds,
-        reliable_source_face_mask,
+        reliable_source_face_mask, movable_vertex_mask,
     )
+    if np.any(preserved):
+        tolerance = max(float(np.linalg.norm(np.ptp(source_points, axis=0))) * 1e-12, 1e-15)
+        if np.any(distances[preserved] > tolerance):
+            raise ValueError("preserved shell is absent from the eligible projection source")
+        # Identity projection: retain the exact source coordinates, including at creases.
+        candidate[preserved] = proxy_points[preserved]
+        rejection[preserved] = 0
     applied = rejection == 0
     intersections = {
         "status": "not_computed",
@@ -472,6 +528,7 @@ def project_closure_to_source(
         "reason": "libigl/CGAL certification belongs to the caller acceptance path",
     }
     provenance = _projection_provenance(proxy_faces_i64, applied, face_ids, target_components, distances, raw_dot, rejection)
+    provenance["point_data"]["source_preserved"] = preserved.astype(np.uint8)
     report = _build_report(
         proxy_points,
         proxy_faces_i64,
@@ -485,6 +542,64 @@ def project_closure_to_source(
         intersections,
     )
     return candidate, np.asarray(proxy_faces).copy(), provenance, report
+
+def interpolate_source_corner_normals(
+    points: np.ndarray, faces: np.ndarray, source_points: np.ndarray, source_faces: np.ndarray,
+    source_normals: np.ndarray, face_source_ids: np.ndarray,
+) -> np.ndarray:
+    """Transport native normal seams without splitting the physical watertight vertices.
+
+    Source face IDs are in the supplied source mesh; -1 denotes a generated wall.
+    Keep the interpolated vector magnitude so subdivision preserves the source
+    normal field. The renderer normalizes after fragment interpolation.
+    """
+    geometric, _ = _unit_face_normals(points, faces)
+    result = np.repeat(geometric[:, None, :], 3, axis=1)
+    ids = np.asarray(face_source_ids, dtype=np.int64)
+    if ids.shape != (len(faces),) or np.any(ids >= len(source_faces)):
+        raise ValueError("face_source_ids must map each candidate face to the supplied source")
+    keep = ids >= 0
+    source_triangles = source_faces[ids[keep]]
+    triangles = source_points[source_triangles]
+    original, _ = _unit_face_normals(source_points, source_faces)
+    direction = np.where(np.einsum("ij,ij->i", geometric[keep], original[ids[keep]]) < 0, -1., 1.)
+    for corner in range(3):
+        weights = np.clip(_barycentric(points[faces[keep, corner]], triangles), 0., 1.)
+        weights /= np.maximum(weights.sum(axis=1)[:, None], 1e-20)
+        result[keep, corner] = np.einsum("ij,ijk->ik", weights, source_normals[source_triangles]) * direction[:, None]
+    return result.reshape(-1, 9).astype(np.float32)
+
+
+def interpolate_source_normals(
+    points: np.ndarray, faces: np.ndarray, source_points: np.ndarray, source_faces: np.ndarray,
+    provenance: dict[str, dict[str, np.ndarray]], source_normals: np.ndarray | None = None,
+) -> np.ndarray:
+    """Retain native smooth shading on projected vertices; generated patches use their geometry."""
+    import pyvista as pv
+
+    packed = np.column_stack((np.full(len(faces), 3), faces)).ravel()
+    field = np.asarray(pv.PolyData(points, packed).compute_normals(
+        cell_normals=False, split_vertices=False,
+    ).point_data["Normals"], dtype=float).copy()
+    applied = np.asarray(provenance["point_data"]["source_projection_applied"], dtype=bool)
+    if not np.any(applied):
+        return field.astype(np.float32)
+    if source_normals is None:
+        source_packed = np.column_stack((np.full(len(source_faces), 3), source_faces)).ravel()
+        source_normals = np.asarray(pv.PolyData(source_points, source_packed).compute_normals(
+            cell_normals=False, split_vertices=False,
+        ).point_data["Normals"])
+    ids = np.asarray(provenance["point_data"]["nearest_source_face_id"], dtype=np.int64)[applied]
+    triangles = source_faces[ids]
+    weights = _barycentric(points[applied], source_points[triangles])
+    mapped = np.einsum("ij,ijk->ik", weights, source_normals[triangles])
+    lengths = np.linalg.norm(mapped, axis=1)
+    valid = np.isfinite(mapped).all(axis=1) & (lengths > 1e-15)
+    mapped[valid] /= lengths[valid, None]
+    mapped[np.einsum("ij,ij->i", mapped, field[applied]) < 0] *= -1
+    field[np.flatnonzero(applied)[valid]] = mapped[valid]
+    return field.astype(np.float32)
+
 
 def rollback_reported_self_intersections(
     points: np.ndarray,

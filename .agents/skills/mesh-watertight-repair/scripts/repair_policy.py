@@ -24,6 +24,7 @@ SHAPE_PRIOR_OPTIONS = [
 POLICY_ELIGIBLE_CLASSIFICATIONS = {
     "pending_policy",
     "large_opening_or_missing_surface",
+    "part_perimeter_or_opening_unknown",
 }
 def build_policy_packet(
     inventory: dict[str, Any],
@@ -34,7 +35,9 @@ def build_policy_packet(
 ) -> dict[str, Any]:
     context = run_context or {}
     run_fingerprint = stable_fingerprint({"target": target_name, "run_context": context})
-    regions = policy_regions(inventory)
+    regions = (inventory.get("boundary_regions", {}).get("items", [])
+               if target_name in ("print-material", "watertight-material") or context.get("purpose") == "cfd"
+               else policy_regions(inventory))
     packet_items = []
     for region in regions:
         item = {
@@ -107,6 +110,7 @@ def build_policy_packet(
         },
         "policy_rules": [
             "AI policy may choose only among declared options.",
+            "Intent is an inference: record evidence, reasons, and uncertainty; confidence is not proof of functional correctness.",
             "AI policy cannot override deterministic topology, source-distance, bbox, silhouette, volume, or orientation gates.",
             "A cap or porous decision still requires a deterministic geometry pass before acceptance.",
             "AI may select semantic_label and shape_prior, but neither may bypass geometric transaction gates.",
