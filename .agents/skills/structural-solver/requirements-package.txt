@@ -1,0 +1,2 @@
+# Optional local release build tool. Runtime dependencies are bundled into the CLI.
+pyinstaller>=6,<7

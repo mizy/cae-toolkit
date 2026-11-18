@@ -13,22 +13,25 @@ The solver is self-contained: gmsh builds box meshes, the hinge uses a determini
 numpy mesher (gmsh OCC boolean meshing of knuckle cylinders hangs, so the hinge avoids it),
 rendering uses pyvista offscreen.
 
-## Native Rust core
+## Shared Rust + wgpu equation core
 
-The FE hot path (T4/T10 element stiffness, sparse assembly, faer sparse LU solve,
-stress recovery) is implemented in Rust under `native/` and is used automatically
-when the release binary exists:
+`core/` owns the CSR equation contract, CPU f64 PCG, GPU PCG WGSL kernels and
+true-residual correction. It builds as a native binary and as WASM for `web/`.
+GPU vectors and reductions stay resident for batches of up to 512 iterations.
+The browser page accepts model + conditions and uses the local `serve_web.py`
+service for automatic initial solid T10 meshing/assembly, then solves in WASM
+and WebGPU. See [`web/README.md`](web/README.md) for build/run instructions.
 
-```bash
-cd native && cargo build --release
-```
+`native/` retains Rust FEM assembly, stress recovery and faer CPU LU, and now
+calls `core/` for its GPU equation solve. `solve.py --backend auto` attempts that
+GPU path for T10 when the native binary exists; explicit `gpu` fails on errors,
+`cpu` uses the CPU route. Automatic mode warns before Python fallback. T4 uses
+the Python path through the legacy CLI. Build both Rust packages after checkout;
+binaries and generated WASM are not committed.
 
-`solve.py` shells out to `native/target/release/structural_solver_native` with the
-mesh (MSH 2.2) and BCs (JSON), reads displacement/stress binaries back, and falls
-back to the Python scipy solver when the binary is missing or fails. Results agree
-with the Python reference to ~1e-10 relative (same quadrature, node ordering,
-Jacobian convention). Measured: hinge 1.5 mm case (9120 T10 / ~27k dof) solves in
-~0.2 s vs ~20 s in Python; end-to-end CLI ~10x faster.
+The supported physical model remains solid, small-strain, linear isotropic
+elasticity. Shell/beam elements, midsurface extraction, arbitrary CAD input and
+automatic mesh-convergence refinement are not yet implemented.
 
 ## Quick Start
 
@@ -84,3 +87,18 @@ Analytical benchmarks run inside every report:
 
 Gates: reaction balance |ΣR+F|/|F| < 1%, energy consistency, VTP read-back audit,
 positive Jacobians, optional convergence (coarse/fine delta change < 15%).
+
+## Gravity and known bore loads
+
+The local model preparation path accepts single closed STL surfaces and preserves
+source facets when generating volume elements. `scripts/loads.py` integrates T4/T10
+body forces from explicit density and gravity, and planar T3/T6 cylindrical surface
+pressure or half-bore bearing loads. Cylinder regions require explicit center,
+axis, radius and tolerance; this is not interactive or general automatic hole
+recognition. The page exposes self weight; the preparation API exposes cylinder
+loads. See `web/README.md` for the precise input limitations.
+
+Use `scripts/validate_loads.py --output-dir OUTPUT` to reproduce synthetic STL
+bearing/pressure and cantilever self-weight checks. It runs native CPU/GPU solves,
+checks resultants, reactions, source topology/volume and analytical beam deflection,
+and writes HTML/JSON evidence. No bolt pretension, friction or contact is included.

@@ -8,3 +8,6 @@ faer = "0.24.4"
 rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+
+structural-core = { path = "../core" }
+pollster = "0.3"

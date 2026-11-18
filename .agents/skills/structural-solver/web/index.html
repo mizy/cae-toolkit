@@ -1,36 +1,30 @@
 <!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>结构静力 · 浏览器求解原型</title>
-  <style>
-    body { font: 16px/1.6 system-ui, sans-serif; background: #f4f7fa; color: #182c40; margin: 0; }
-    main { max-width: 800px; margin: 6vh auto; padding: 0 24px; }
-    h1 { margin-bottom: .25em; } p { color: #506478; }
-    section { background: white; border: 1px solid #dbe5ee; border-radius: 12px; padding: 24px; margin: 20px 0; }
-    label { display: block; font-weight: 600; margin: 12px 0 6px; }
-    input { max-width: 100%; } button { background: #1766ad; color: white; border: 0; border-radius: 6px; padding: 10px 20px; font-size: 16px; cursor: pointer; margin: 20px 8px 0 0; }
-    button:disabled { background: #9daeba; cursor: default; } pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-    .notice { border-left: 4px solid #e5a72e; padding-left: 12px; } a { color: #1766ad; }
-  </style>
-</head>
-<body><main>
-  <h1>浏览器结构静力求解</h1>
-  <p>WebGPU 线性方程原型 · 所有计算在本机进行</p>
-  <section>
-    <p class="notice">研究原型：导入由本项目导出的有限元方程，使用 GPU 计算稀疏矩阵乘法。请与双精度参考结果核对，暂勿用于工程定型。</p>
-    <label for="input">有限元方程 JSON</label>
-    <input id="input" type="file" accept=".json,application/json">
-    <label for="case">本地示例</label>
-    <select id="case"><option value="example.json">拉伸杆</option><option value="example-bending.json">悬臂梁弯曲</option></select>
-    <label for="tolerance">相对残差目标</label>
-    <input id="tolerance" type="number" value="0.00001" min="0.0000001" max="0.1" step="any">
-    <label for="iterations">最大迭代次数</label>
-    <input id="iterations" type="number" value="3000" min="1" max="10000" step="1">
-    <label for="preconditioner">预条件器</label>
-    <select id="preconditioner"><option value="jacobi">Jacobi</option><option value="block-jacobi">节点 3×3 块 Jacobi</option></select>
-    <div><button id="example">载入示例</button><button id="solve" disabled>开始求解</button><button id="download" disabled>下载位移 JSON</button></div>
-  </section>
-  <section><strong>状态与结果</strong><pre id="result" role="status" aria-live="polite">请选择方程文件。</pre></section>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>结构静力 · 模型与条件</title>
+<style>
+[hidden]{display:none!important}
+body{font:16px/1.6 system-ui,sans-serif;background:#f4f7fa;color:#182c40;margin:0}main{max-width:850px;margin:4vh auto;padding:0 24px}h1{margin-bottom:.2em}p{color:#506478}section{background:white;border:1px solid #dbe5ee;border-radius:12px;padding:24px;margin:20px 0}label{display:block;font-weight:600;margin:10px 0 5px}input,select{font:inherit;max-width:100%;box-sizing:border-box;padding:6px}button{background:#1766ad;color:white;border:0;border-radius:6px;padding:10px 20px;font:inherit;cursor:pointer;margin:16px 8px 0 0}button:disabled{background:#9daeba;cursor:default}pre{white-space:pre-wrap;overflow-wrap:anywhere}.row{display:flex;flex-wrap:wrap;gap:16px}.row>label{flex:1;min-width:140px}details{margin-top:18px}h2{margin:0}
+</style></head><body><main>
+<h1>结构静力分析</h1><p>输入模型与物理条件，自动生成初始实体网格并求解。</p>
+<form id="analysis">
+<section><h2>模型</h2>
+<label for="geometry">几何</label><select id="geometry"><option value="box">长方体</option><option value="stl">STL 实体</option><option value="hinge">简化铰链（单一连续实体）</option></select>
+<label id="stl-field" hidden>STL 文件<input id="stl" type="file" accept=".stl"></label>
+<div class="row"><label>长<input id="length" type="number" value="100" min="0.01" step="any" required></label><label>宽<input id="width" type="number" value="10" min="0.01" step="any" required></label><label>厚<input id="height" type="number" value="10" min="0.01" step="any" required></label></div>
+<label for="units">单位</label><select id="units"><option value="mm">mm</option><option value="m">m</option></select>
+<p>当前提供实体单元分析。薄壁壳模型与自动抽中面尚未开放。</p>
+</section>
+<section><h2>条件</h2>
+<div class="row"><label>材料<select id="material"><option value="steel">钢</option><option value="aluminum">铝</option><option value="titanium">钛</option><option value="cast_iron">铸铁</option></select></label><label>固定面<select id="fix"><option>x_min</option><option>x_max</option><option>y_min</option><option>y_max</option><option>z_min</option><option>z_max</option></select></label><label>受力面<select id="face"><option>x_max</option><option>x_min</option><option>y_min</option><option>y_max</option><option>z_min</option><option>z_max</option></select></label></div>
+<div class="row"><label>Fx / N<input id="fx" type="number" value="1000" step="any" required></label><label>Fy / N<input id="fy" type="number" value="0" step="any" required></label><label>Fz / N<input id="fz" type="number" value="0" step="any" required></label></div>
+<p>力按选中面的节点均分；此分布不等同于均匀压力。材料按小应变、各向同性线弹性处理。</p>
+<label><input id="self-weight" type="checkbox"> 包含自重</label>
+<div class="row"><label>密度 / kg·m⁻³<input id="density" type="number" value="7850" min="1" step="any"></label><label>重力 Z / m·s⁻²<input id="gravity-z" type="number" value="-9.80665" step="any"></label></div>
+<button type="submit" id="solve">自动准备并求解</button><button type="button" id="download" disabled>下载结果</button>
+<details><summary>高级：求解后端与已有方程</summary>
+<label for="backend">后端</label><select id="backend"><option value="auto">自动（GPU 优先，必要时 CPU）</option><option value="gpu">Rust + WebGPU</option><option value="cpu">Rust CPU 双精度</option></select>
+<label for="input">导入已准备方程 JSON</label><input id="input" type="file" accept=".json"><button type="button" id="prepared">求解已载入方程</button>
+</details>
+</section></form>
+<section><strong>状态与结果</strong><pre id="result" role="status" aria-live="polite">请设置模型与条件。</pre></section>
 </main><script type="module" src="./app.js"></script></body></html>

@@ -16,6 +16,8 @@ use serde::Deserialize;
 #[derive(Deserialize)]
 struct Bc {
     material: Material,
+    #[serde(default = "default_backend")]
+    backend: String,
     #[serde(default)]
     fixes: Vec<String>,
     #[serde(default)]
@@ -34,6 +36,8 @@ struct Load {
     face: String,
     force: [f64; 3],
 }
+
+fn default_backend() -> String { "gpu".into() }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -94,7 +98,8 @@ fn main() {
         [0.0, 0.0, 0.0]
     };
 
-    let res = fem::solve_linear(&tm, bc.material.e, bc.material.nu, &fixed_dofs, &load_vector);
+    if !["gpu", "cpu"].contains(&bc.backend.as_str()) { eprintln!("backend must be gpu or cpu"); std::process::exit(2); }
+    let res = fem::solve_linear(&tm, bc.material.e, bc.material.nu, &fixed_dofs, &load_vector, &bc.backend);
 
     let (delta, stiffness) = fem::stiffness(&res.u, &load_nodes, &fsum);
     let vm = fem::von_mises(&res.sigma);
@@ -127,6 +132,7 @@ fn main() {
     write_f64(&spath, &sflat).unwrap();
 
     let summary = serde_json::json!({
+        "backend": res.backend,
         "nodes": n,
         "elements": tm.elements.len(),
         "order": tm.order,

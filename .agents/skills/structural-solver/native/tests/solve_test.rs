@@ -102,7 +102,7 @@ fn solve_case(mesh: &TetMesh, fix: &str, load_face: &str, force: [f64; 3]) -> fe
         }
     }
     let (b, _) = fem::build_load_vector(n, &[(load_face.to_string(), force)], &mesh.nodes);
-    fem::solve_linear(mesh, 210e9, 0.3, &fixed, &b)
+    fem::solve_linear(mesh, 210e9, 0.3, &fixed, &b, "cpu")
 }
 
 #[test]

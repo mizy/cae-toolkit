@@ -219,6 +219,7 @@ pub struct SolveResult {
     pub volumes: Vec<f64>,
     pub strain_energy: f64,
     pub reaction_sum: [f64; 3],
+    pub backend: String,
     pub time_assembly_s: f64,
     pub time_lu_s: f64,
     pub time_stress_s: f64,
@@ -230,6 +231,7 @@ pub fn solve_linear(
     nu: f64,
     fixed_dofs: &std::collections::HashSet<usize>,
     load_vector: &[f64],
+    backend: &str,
 ) -> SolveResult {
     let n = mesh.nodes.len();
     let ndof = 3 * n;
@@ -282,6 +284,21 @@ pub fn solve_linear(
         trips_mod.push((fd, fd, 1.0));
     }
     trips_mod.sort_unstable_by_key(|a| (a.0, a.1));
+    let time_assembly_s = t0.elapsed().as_secs_f64();
+
+    // solve
+    let t1 = std::time::Instant::now();
+    let u: Vec<f64> = if backend == "gpu" {
+        let mut row_ptr = vec![0u32; ndof+1];
+        for &(r, _, _) in &trips_mod { row_ptr[r+1] += 1; }
+        for i in 0..ndof { row_ptr[i+1] += row_ptr[i]; }
+        let mut rhs = load_vector.to_vec();
+        for &fd in fixed_dofs { rhs[fd] = 0.0; }
+        let system = structural_core::LinearSystem { row_ptr, col_idx: trips_mod.iter().map(|t|t.1 as u32).collect(), values: trips_mod.iter().map(|t|t.2).collect(), rhs };
+        let result = pollster::block_on(structural_core::solve(&system,"gpu",1e-5,6000)).expect("GPU solve failed");
+        assert!(result.converged,"GPU did not converge");
+        result.solution
+    } else {
     let faer_trips: Vec<Triplet<usize, usize, f64>> = trips_mod
         .iter()
         .map(|(r, c, v)| Triplet::new(*r, *c, *v))
@@ -289,10 +306,6 @@ pub fn solve_linear(
     let mat = SparseColMat::try_new_from_triplets(ndof, ndof, &faer_trips)
         .map_err(|e| format!("faer triplet error {e:?}"))
         .expect("matrix build failed");
-    let time_assembly_s = t0.elapsed().as_secs_f64();
-
-    // solve
-    let t1 = std::time::Instant::now();
     let symbolic = factorize_symbolic_lu(mat.symbolic(), LuSymbolicParams::default())
         .expect("symbolic LU failed");
     let mut numeric = NumericLu::<usize, f64>::new();
@@ -304,10 +317,11 @@ pub fn solve_linear(
         .expect("numeric LU failed");
     let mut rhs = Mat::<f64>::zeros(ndof, 1);
     for i in 0..ndof {
-        rhs[(i, 0)] = load_vector[i];
+        rhs[(i, 0)] = if fixed_dofs.contains(&i) { 0.0 } else { load_vector[i] };
     }
     lu.solve_in_place_with_conj(faer::Conj::No, rhs.as_mut(), faer::Par::Seq, stack);
-    let u: Vec<f64> = (0..ndof).map(|i| rhs[(i, 0)]).collect();
+    (0..ndof).map(|i| rhs[(i, 0)]).collect()
+    };
     let time_lu_s = t1.elapsed().as_secs_f64();
 
     // reactions at fixed dofs from the full K: r = K u - b
@@ -366,6 +380,7 @@ pub fn solve_linear(
         volumes,
         strain_energy: 0.5 * energy,
         reaction_sum,
+        backend: backend.into(),
         time_assembly_s,
         time_lu_s,
         time_stress_s,

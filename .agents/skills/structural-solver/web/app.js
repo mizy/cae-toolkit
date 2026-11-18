@@ -1,73 +1,74 @@
 import { solvePCG } from './gpu-solver.js';
-
-const file = document.querySelector('#input');
-const solve = document.querySelector('#solve');
-const download = document.querySelector('#download');
-const output = document.querySelector('#result');
+const $ = id => document.getElementById(id);
 let data, result;
+const value = id => $(id).value;
 
-function loadCase(value, name) {
-  if (!Array.isArray(value.rowPtr) || !Array.isArray(value.colIdx) ||
-      !Array.isArray(value.values) || !Array.isArray(value.rhs)) throw new Error('缺少 CSR 方程数据');
-  data = value; result = null; download.disabled = true; solve.disabled = false;
-  const meta = data.metadata || {};
-  const forces = (meta.loads || []).map(load => `${load.face}: [${load.force_total.join(', ')}] N`).join('；');
-  output.textContent = `已载入 ${name}\n几何：${meta.geometry || '未提供'}\n材料：${meta.material || '未提供'}\n固定：${meta.fixes?.join('、') || meta.fix || '未提供'}\n载荷：${forces || '未提供'}\n自由度：${data.rhs.length}\n矩阵非零项：${data.values.length}`;
+function busy(state) {
+  for (const input of document.querySelectorAll('form input, form select, form button')) input.disabled = state;
+  $('download').disabled = state || !result?.converged;
+  if (!state && value('geometry') !== 'box') {
+    for (const id of ['length','width','height']) $(id).disabled = true;
+    $('units').disabled = value('geometry') === 'hinge';
+  }
 }
-document.querySelector('#example').addEventListener('click', async () => {
+async function run(prepare) {
+  result = null; busy(true);
+  const started = performance.now();
   try {
-    const select = document.querySelector('#case');
-    const response = await fetch(`./${select.value}`);
-    if (!response.ok) throw new Error(`请先按照使用说明生成 ${select.value}`);
-    loadCase(await response.json(), select.selectedOptions[0].textContent);
-  } catch (error) { output.textContent = `无法载入示例：${error.message}`; }
-});
-
-file.addEventListener('change', async () => {
-  data = result = null;
-  solve.disabled = download.disabled = true;
-  if (!file.files.length) return;
-  try {
-    loadCase(JSON.parse(await file.files[0].text()), file.files[0].name);
-  } catch (error) { output.textContent = `无法读取：${error.message}`; }
-});
-
-solve.addEventListener('click', async () => {
-  solve.disabled = true;
-  file.disabled = true;
-  document.querySelector('#example').disabled = true;
-  document.querySelector('#case').disabled = true;
-  download.disabled = true;
-  output.textContent = '正在初始化 GPU 并求解，较大的模型可能需要一些时间……';
-  await new Promise(requestAnimationFrame);
-  try {
-    const tolerance = Number(document.querySelector('#tolerance').value);
-    const maxIterations = Number(document.querySelector('#iterations').value);
-    if (!(tolerance >= 1e-7 && tolerance <= 0.1) || !Number.isInteger(maxIterations) || maxIterations < 1 || maxIterations > 10000) throw new Error('请检查残差目标和迭代次数');
-    const preconditioner = document.querySelector('#preconditioner').value;
-    result = await solvePCG({ ...data, tolerance, maxIterations, preconditioner, onProgress: (iteration, residual) => {
-      output.textContent = `正在求解：第 ${iteration} 次迭代，递推相对残差 ${residual.toExponential(3)}…`;
-    } });
-    let text = `${result.converged ? '已收敛' : '未收敛'}\n迭代次数：${result.iterations}\n真实相对残差：${result.relativeResidual.toExponential(4)}\n求解时间：${(result.timingMs / 1000).toFixed(3)} s`;
-    if (data.metadata?.displacement_unit === 'm' && result.solution.length % 3 === 0) {
-      let max = 0;
-      for (let i = 0; i < result.solution.length; i += 3) max = Math.max(max, Math.hypot(result.solution[i], result.solution[i+1], result.solution[i+2]));
-      text += `\n最大位移：${max.toExponential(5)} m`;
+    if (prepare) {
+      $('result').textContent = '正在本机准备模型、生成 T10 网格和有限元方程……';
+      const geometry = value('geometry') === 'box' ? `box:${value('length')},${value('width')},${value('height')}` : value('geometry');
+      const model = { geometry, units: value('units') };
+      if (geometry === 'stl') {
+        const file = $('stl').files[0];
+        if (!file || file.size > 10*1024*1024) throw new Error('请选择不超过 10 MB 的封闭 STL');
+        model.stl_base64 = await new Promise((resolve,reject) => {
+          const reader = new FileReader(); reader.onload = () => resolve(reader.result.split(',')[1]); reader.onerror = reject; reader.readAsDataURL(file);
+        });
+      }
+      const conditions = { material:value('material'), fixes:[value('fix')], loads:[] };
+      if (['fx','fy','fz'].some(id => Number(value(id)) !== 0)) conditions.loads = [`${value('face')}: fx=${value('fx')},fy=${value('fy')},fz=${value('fz')}`];
+      if ($('self-weight').checked) { conditions.gravity = [0,0,Number(value('gravity-z'))]; conditions.density = Number(value('density')); }
+      const response = await fetch('./prepare', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        model, conditions,
+      }) });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.error || '模型准备失败');
+      data = body;
     }
-    if (Array.isArray(data.reference) && data.reference.length === result.solution.length) {
-      let diff = 0, norm = 0;
-      for (let i = 0; i < data.reference.length; i++) { diff += (result.solution[i] - data.reference[i]) ** 2; norm += data.reference[i] ** 2; }
-      if (norm > 0) text += `\n相对参考位移 L2 误差：${(Math.sqrt(diff / norm) * 100).toPrecision(4)}%`;
+    if (!data?.rhs?.length) throw new Error('请先准备或导入方程');
+    $('result').textContent = `方程已准备：${data.rhs.length} 自由度，正在求解……`;
+    const time = performance.now();
+    result = await solvePCG(data, value('backend'));
+    let text = `${result.converged ? '已收敛' : '未收敛'}\n后端：${result.backend}\n自动单元：${data.metadata?.representation || `T${data.metadata?.order === 1 ? 4 : 10}`}\n自由度：${data.rhs.length}\n迭代次数：${result.iterations}\n真实相对残差：${result.relativeResidual.toExponential(4)}\n求解耗时：${((performance.now()-time)/1000).toFixed(3)} s\n本次总耗时：${((performance.now()-started)/1000).toFixed(3)} s`;
+    if (data.reference?.length === result.solution.length) {
+      let error = 0, norm = 0;
+      for (let i = 0; i < data.reference.length; i++) { error += (result.solution[i]-data.reference[i])**2; norm += data.reference[i]**2; }
+      if (norm > 0) text += `\n相对参考位移 L2 误差：${(Math.sqrt(error/norm)*100).toPrecision(4)}%`;
     }
-    output.textContent = text;
-    download.disabled = !result.converged;
-  } catch (error) { output.textContent = `求解失败：${error.message}`; }
-  finally { solve.disabled = false; file.disabled = false; document.querySelector('#example').disabled = false; document.querySelector('#case').disabled = false; }
+    const gravity = data.metadata?.integrated_loads?.gravity;
+    if (gravity) text += `\n质量：${gravity.mass_kg.toPrecision(6)} kg\n自重：[${gravity.total_force_n.map(v=>v.toPrecision(5)).join(', ')}] N`;
+    if (result.fallbackReason) text += `\n已自动转为 CPU：${result.fallbackReason}`;
+    $('result').textContent = text;
+  } catch (error) { $('result').textContent = `失败：${error.message || error}`; }
+  finally { busy(false); }
+}
+$('analysis').addEventListener('submit', event => { event.preventDefault(); run(true); });
+$('prepared').addEventListener('click', () => run(false));
+$('input').addEventListener('change', async () => {
+  result = data = null; $('download').disabled = true;
+  try { data = JSON.parse(await $('input').files[0].text()); $('result').textContent = `已载入方程：${data.rhs.length} 自由度`; }
+  catch (error) { $('result').textContent = `导入失败：${error.message}`; }
 });
-
-download.addEventListener('click', () => {
-  const blob = new Blob([JSON.stringify({ coordinates: data.coordinates, metadata: data.metadata, displacement: Array.from(result.solution), iterations: result.iterations, relativeResidual: result.relativeResidual })], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a'); link.href = url; link.download = 'displacement.json'; link.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+$('geometry').addEventListener('change', () => {
+  const hinge = value('geometry') === 'hinge';
+  $('stl-field').hidden = value('geometry') !== 'stl';
+  for (const id of ['length','width','height']) $(id).disabled = value('geometry') !== 'box';
+  $('units').value = 'mm'; $('units').disabled = hinge;
+});
+$('download').addEventListener('click', () => {
+  const blob = new Blob([JSON.stringify({model:data.model,conditions:data.conditions,coordinates:data.coordinates,metadata:data.metadata,...result})], {type:'application/json'});
+  const url = URL.createObjectURL(blob), link = document.createElement('a');
+  link.href=url; link.download='structural-result.json'; link.click();
+  setTimeout(() => URL.revokeObjectURL(url),1000);
 });

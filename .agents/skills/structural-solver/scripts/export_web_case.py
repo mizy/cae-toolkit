@@ -12,16 +12,17 @@ from scipy.sparse.linalg import spsolve
 from assembly import MATERIALS, apply_dirichlet, assemble, elasticity_D
 from boundary import build_load_vector, face_nodes
 from mesh_tet import build_tet_mesh
+from loads import gravity_load, cylinder_load
 
 
 def export_case(geometry: str, units: str, mesh_size: float, order: int,
-                material: str, fix: str | list[str], load: str | list[str], output: Path) -> dict:
+                material: str, fix: str | list[str], load: str | list[str], output: Path, *, mesh=None, gravity=None, density=None, cylinder=None) -> dict:
     """Assemble in SI units and export CSR plus an independent CPU reference."""
     fixes = [fix] if isinstance(fix, str) else fix
     load_specs = [load] if isinstance(load, str) else load
-    if not fixes or not load_specs:
+    if not fixes or not (load_specs or gravity is not None or cylinder):
         raise ValueError("At least one fixed face and one load are required")
-    mesh = build_tet_mesh(geometry, mesh_size, order, units)
+    mesh = mesh if mesh is not None else build_tet_mesh(geometry, mesh_size, order, units)
     mat = MATERIALS[material]
     fixed_nodes = np.unique(np.concatenate([face_nodes(mesh.nodes, f) for f in fixes]))
     fixed_dofs = (3 * fixed_nodes[:, None] + np.arange(3)).ravel()
@@ -32,6 +33,20 @@ def export_case(geometry: str, units: str, mesh_size: float, order: int,
         if np.intersect1d(fixed_nodes, face_nodes(mesh.nodes, record["face"])).size:
             raise ValueError(f"Load face {record['face']} overlaps a fixed face; choose disjoint faces")
     stiffness, _ = assemble(mesh.nodes, mesh.elements, elasticity_D(mat.E, mat.nu), order)
+    load_details = {}
+    if gravity is not None:
+        if density is None:
+            raise ValueError("Self weight requires density in kg/m3")
+        body_force, load_details["gravity"] = gravity_load(mesh.nodes, mesh.elements, order, density, gravity)
+        rhs += body_force
+    if cylinder:
+        traction, details = cylinder_load(mesh.nodes, mesh.elements, order, cylinder)
+        if np.any(traction[fixed_dofs]):
+            raise ValueError("Cylinder load overlaps fixed degrees of freedom")
+        details.pop("region_nodes")
+        load_details["cylinder"] = details
+        rhs += traction
+    original_stiffness, original_rhs = stiffness, rhs.copy()
     stiffness, rhs = apply_dirichlet(stiffness, rhs, fixed_dofs)
     if not np.any(rhs):
         raise ValueError("No load remains on free degrees of freedom")
@@ -43,6 +58,13 @@ def export_case(geometry: str, units: str, mesh_size: float, order: int,
     residual = np.linalg.norm(stiffness @ reference - rhs) / np.linalg.norm(rhs)
     if not np.isfinite(residual) or residual > 1e-7:
         raise ValueError(f"Reference solve residual {residual:.3g} is too large; check constraints and mesh")
+    reaction = original_stiffness @ reference - original_rhs
+    total_force = original_rhs.reshape(-1,3).sum(axis=0)
+    reaction_sum = reaction[fixed_dofs].reshape(-1,3).sum(axis=0)
+    force_scale = np.sum(np.linalg.norm(original_rhs.reshape(-1,3),axis=1))
+    load_details["total_force_n"] = total_force.tolist()
+    load_details["reference_reaction_n"] = reaction_sum.tolist()
+    load_details["reference_force_balance"] = float(np.linalg.norm(total_force+reaction_sum)/force_scale)
     case = {
         "rowPtr": stiffness.indptr.tolist(),
         "colIdx": stiffness.indices.tolist(),
@@ -54,7 +76,8 @@ def export_case(geometry: str, units: str, mesh_size: float, order: int,
             "geometry": geometry, "units": units, "mesh_size": mesh_size,
             "order": order, "material": material, "fix": fixes[0], "fixes": fixes, "loads": loads,
             "nodes": len(mesh.nodes), "elements": len(mesh.elements),
-            "dofs": len(rhs), "nnz": stiffness.nnz, "load_distribution": "equal nodal forces",
+            "dofs": len(rhs), "nnz": stiffness.nnz, "load_distribution": "equal nodal forces" if loads else "consistent integrated loads",
+            "integrated_loads":load_details,
             "coordinate_unit": "m", "displacement_unit": "m", "force_unit": "N",
             "dof_order": "node-major xyz", "reference_relative_residual": float(residual),
         },

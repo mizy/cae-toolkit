@@ -28,3 +28,18 @@
 2. 报告残差、迭代次数、位移误差和耗时，覆盖拉伸杆、悬臂梁及更大网格。
 3. 比较 f32 的可用精度、预条件效果、设备限制和不收敛表现，必要时保留 CPU f64 路径。
 4. 在数值可靠性建立后，再扩展模型导入、交互式边界条件、云图及导出。
+
+## 2026-11-11 architecture update
+
+Inputs are split into model (geometry, units) and conditions (material,
+constraints, loads). Automatic initial T10 meshing and equation preparation
+currently support the existing box/one-body hinge models. The shared Rust
+`core/` now supplies both native wgpu and WASM/WebGPU equation solves. GPU vectors,
+dot products and updates stay resident for batches; Rust checks the original f64
+residual and applies corrections. The browser has no separate JS solver.
+Native FEM assembly/stress recovery and faer CPU LU remain in `native/`;
+Python owns current meshing, equation export and reporting.
+
+Future work: migrate remaining FEM operations where justified, add supported
+model formats and mesh convergence, then separately validate shell/beam elements
+and geometry extraction. Automatic midsurface extraction is not available.

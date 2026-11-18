@@ -140,7 +140,10 @@ def build_tet_mesh(geometry: str, mesh_size: float, order: int, units: str) -> T
             dims = tuple(float(v) for v in params.split(","))
             if len(dims) != 3 or min(dims) <= 0:
                 raise ValueError(f"bad box spec: {geometry!r}, need Lx,Ly,Lz > 0")
-            bodies = build_box(gmsh, dims)
+            scale = 1.0 if units == "m" else 1e-3 if units == "mm" else None
+            if scale is None:
+                raise ValueError(f"unsupported units: {units!r}")
+            bodies = build_box(gmsh, tuple(v * scale for v in dims))
         elif name == "hinge":
             return build_hinge_manual(mesh_size=mesh_size, order=order, units=units)
         else:

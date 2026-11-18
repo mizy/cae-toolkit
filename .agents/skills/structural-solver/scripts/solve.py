@@ -36,7 +36,7 @@ from report import build_report_json, write_html, write_json  # noqa: E402
 NATIVE_BIN = Path(__file__).resolve().parent.parent / "native" / "target" / "release" / "structural_solver_native"
 
 
-def solve_core(nodes, elements, order, mat, load_vector, fixed_dofs, fixes, loads, mesh_size):
+def solve_core(nodes, elements, order, mat, load_vector, fixed_dofs, fixes, loads, mesh_size, backend="auto"):
     """Solve via the Rust native core when available (T10), else Python fallback.
 
     Returns (u, sigma, native_summary_or_None).
@@ -48,6 +48,7 @@ def solve_core(nodes, elements, order, mat, load_vector, fixed_dofs, fixes, load
             write_msh22(nodes, elements, order, msh)
             bc = {
                 "material": {"E": mat.E, "nu": mat.nu},
+                "backend": "gpu" if backend == "auto" else backend,
                 "fixes": list(fixes),
                 "loads": [{"face": lc["face"], "force": lc["force_total"]} for lc in loads],
             }
@@ -57,6 +58,14 @@ def solve_core(nodes, elements, order, mat, load_vector, fixed_dofs, fixes, load
                 [str(NATIVE_BIN), str(msh), str(tmp / "bc.json"), str(prefix)],
                 capture_output=True, text=True, timeout=900,
             )
+            if r.returncode != 0 and backend == "auto":
+                warnings.warn("GPU solve failed or did not converge; retrying native CPU f64")
+                bc["backend"] = "cpu"
+                (tmp / "bc.json").write_text(json.dumps(bc), encoding="utf-8")
+                r = subprocess.run(
+                    [str(NATIVE_BIN), str(msh), str(tmp / "bc.json"), str(prefix)],
+                    capture_output=True, text=True, timeout=900,
+                )
             if r.returncode != 0:
                 raise RuntimeError(r.stderr.strip() or "native solver failed")
             u = np.fromfile(prefix.with_suffix(".u.bin"), dtype="<f8")
@@ -71,7 +80,11 @@ def solve_core(nodes, elements, order, mat, load_vector, fixed_dofs, fixes, load
             }
             return u, sigma, post
         except Exception as e:  # noqa: BLE001
+            if backend == "gpu":
+                raise
             warnings.warn(f"native solver unavailable ({e}); using Python fallback")
+    if backend == "gpu":
+        raise RuntimeError("GPU mode requires the built Rust binary and T10 elements")
     res = solve_linear(nodes, elements, elasticity_D(mat.E, mat.nu), order,
                        load_vector, fixed_dofs, mat)
     u = res["u"]
@@ -144,7 +157,7 @@ def run_solve(*, geometry: str | None = None, mesh_file: str | None = None, unit
               fixes: list[str] | None = None, loads: list[str] | None = None,
               scale: float | str = "auto", output_dir: str | None = None,
               with_benchmarks: bool = True, name: str = "solve",
-              convergence_sizes: tuple[float, float] | None = None) -> dict:
+              convergence_sizes: tuple[float, float] | None = None, backend: str = "auto") -> dict:
     fixes = fixes or []
     loads = loads or []
     fac = _unit_factors(units)
@@ -178,7 +191,7 @@ def run_solve(*, geometry: str | None = None, mesh_file: str | None = None, unit
 
     # 3. solve (native Rust core when available, Python fallback otherwise)
     u, sigma, post = solve_core(
-        nodes, elements, order, mat, load_vector, fixed_dofs, fixes, load_records, mesh_size)
+        nodes, elements, order, mat, load_vector, fixed_dofs, fixes, load_records, mesh_size, backend)
     vm = von_mises(sigma)
     delta, stiffness = compute_stiffness(u.reshape(-1, 3), load_nodes, F_total)
     max_u = float(np.max(np.linalg.norm(u.reshape(-1, 3), axis=1)))
@@ -352,7 +365,7 @@ def run_solve(*, geometry: str | None = None, mesh_file: str | None = None, unit
             "report_json": None, "report_html": None,
         },
         runtime={
-            "solver": "rust faer sparse LU" if post.get("native") else "python scipy spsolve (SuperLU)",
+            "solver": ("rust wgpu PCG" if post.get("native", {}).get("backend") == "gpu" else "rust faer sparse LU") if post.get("native") else "python scipy spsolve (SuperLU)",
             "element": f"T{10 if order == 2 else 4}",
             "native_times_s": post.get("native", {}).get("time_total_s"),
         },
@@ -374,6 +387,7 @@ def main() -> None:
     p.add_argument("--geometry", help="box:Lx,Ly,Lz or hinge (dims in --units)")
     p.add_argument("--mesh", help="existing gmsh MSH 2.2 tetrahedral mesh")
     p.add_argument("--units", default="m", choices=["m", "mm"])
+    p.add_argument("--backend", choices=["auto", "gpu", "cpu"], default="auto")
     p.add_argument("--material", default="steel", choices=sorted(MATERIALS))
     p.add_argument("--order", type=int, default=2, choices=[1, 2])
     p.add_argument("--mesh-size", type=float, help="target element size in --units")
@@ -392,7 +406,7 @@ def main() -> None:
             geometry=args.geometry, mesh_file=args.mesh, units=args.units,
             material_name=args.material, order=args.order, mesh_size=args.mesh_size,
             fixes=args.fix, loads=args.load, scale=args.scale, output_dir=args.output_dir,
-            with_benchmarks=not args.no_benchmarks, name=args.name, convergence_sizes=conv,
+            with_benchmarks=not args.no_benchmarks, name=args.name, convergence_sizes=conv, backend=args.backend,
         )
         ok = all(g["passed"] for g in report["gates"].values())
         bench_ok = all(b["passed"] for b in report["validation"]["benchmarks"])
