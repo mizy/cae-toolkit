@@ -179,6 +179,7 @@ class CoefficientModel(nn.Module):
 
     `parameters` is an ordered B×P tensor whose order is stored in the dataset
     manifest. Images are B×2×H×W float tensors with depth and mask channels.
+    Optional B-vector `scene` uses IDs 0 unknown, 1 vehicle and 2 aircraft.
     """
 
     def __init__(
@@ -190,6 +191,7 @@ class CoefficientModel(nn.Module):
         encoder: str = "plain",
         fusion: str = "concat",
         view_feature_size: int | None = None,
+        scene_mode: str = "none",
     ) -> None:
         super().__init__()
         if parameter_count < 1:
@@ -214,6 +216,10 @@ class CoefficientModel(nn.Module):
             raise ValueError("fusion must be concat or attention")
         if fusion == "attention" and variant == "parameters":
             raise ValueError("view attention requires four or five image views")
+        if scene_mode not in {"none", "concat", "film"}:
+            raise ValueError("scene_mode must be none, concat or film")
+        if scene_mode == "film" and variant != "five":
+            raise ValueError("Scene FiLM requires five complete views")
         small = size == "small"
         feature_size = view_feature_size or (32 if small else 128)
         if view_feature_size is not None and (
@@ -226,6 +232,7 @@ class CoefficientModel(nn.Module):
         self.variant = variant
         self.target_count = target_count
         self.fusion = fusion
+        self.scene_mode = scene_mode
         self.image_encoder = None
         self.bottom_encoder = None
         if variant != "parameters":
@@ -247,7 +254,10 @@ class CoefficientModel(nn.Module):
                     encoder in {"pyramid_detail", "pyramid_detail_attention"},
                 )
         self.parameter_encoder = nn.Sequential(
-            nn.Linear(parameter_count, 16 if small else 64),
+            nn.Linear(
+                parameter_count + (8 if scene_mode != "none" else 0),
+                16 if small else 64,
+            ),
             nn.GELU(),
             nn.Linear(16 if small else 64, 8 if small else 32),
             nn.GELU(),
@@ -274,9 +284,54 @@ class CoefficientModel(nn.Module):
             if fusion == "attention"
             else None
         )
+        self.scene_embedding = (
+            nn.Embedding(3, 8, padding_idx=0) if scene_mode != "none" else None
+        )
+        self.scene_film = None
+        if scene_mode == "film":
+            self.scene_film = nn.Sequential(
+                nn.Linear((8 if small else 32) + 8, 32),
+                nn.GELU(),
+                nn.Linear(32, 2 * n_views * feature_size),
+            )
+            nn.init.zeros_(self.scene_film[-1].weight)
+            nn.init.zeros_(self.scene_film[-1].bias)
+
+    def _fuse_views(self, features, parameters, scene):
+        """Share scene conditioning, modulation and fusion across both input paths."""
+        if self.scene_embedding is not None:
+            if scene is None:
+                scene = torch.zeros(
+                    parameters.shape[0], dtype=torch.long, device=parameters.device
+                )
+            if scene.shape != (parameters.shape[0],) or scene.dtype not in (
+                torch.int32,
+                torch.int64,
+            ):
+                raise ValueError(
+                    "scene must be a B-vector of integer IDs: 0 unknown, 1 vehicle, 2 aircraft"
+                )
+            embedded = self.scene_embedding(scene)
+            condition = self.parameter_encoder(torch.cat((parameters, embedded), dim=1))
+        else:
+            condition = self.parameter_encoder(parameters)
+        if self.scene_film is not None:
+            stacked = torch.stack(features, dim=1)
+            modulation = self.scene_film(torch.cat((condition, embedded), dim=1))
+            gamma, beta = modulation.reshape(
+                parameters.shape[0], 2, *stacked.shape[1:]
+            ).unbind(1)
+            active = (scene != 0).to(stacked.dtype)[:, None, None]
+            features = list((stacked * (1 + active * gamma) + active * beta).unbind(1))
+        if self.view_attention is not None:
+            features, _weights = self.view_attention(features, condition)
+        return torch.cat((*features, condition), dim=1)
 
     def encode(
-        self, views: Mapping[str, torch.Tensor], parameters: torch.Tensor
+        self,
+        views: Mapping[str, torch.Tensor],
+        parameters: torch.Tensor,
+        scene: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode complete views and conditions for coefficient and field heads."""
         if parameters.ndim != 2 or parameters.shape[1] != self.parameter_count:
@@ -296,18 +351,17 @@ class CoefficientModel(nn.Module):
             features.extend(encoded)
             if self.variant == "five":
                 features.append(self.bottom_encoder(views["bottom"]))
-        condition = self.parameter_encoder(parameters)
-        if self.view_attention is not None:
-            features, _weights = self.view_attention(features, condition)
-        features.append(condition)
-        return torch.cat(features, dim=1)
+        return self._fuse_views(features, parameters, scene)
 
     def forward(
-        self, views: Mapping[str, torch.Tensor], parameters: torch.Tensor
+        self,
+        views: Mapping[str, torch.Tensor],
+        parameters: torch.Tensor,
+        scene: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return self.head(self.encode(views, parameters))
+        return self.head(self.encode(views, parameters, scene))
 
-    def encode_pooled(self, pooled, parameters):
+    def encode_pooled(self, pooled, parameters, scene=None):
         """Encode cached pre-projection pyramid features with trainable fusion."""
         if self.variant != "five" or not isinstance(self.image_encoder, PyramidEncoder):
             raise ValueError("Pooled encoding requires a five-view pyramid model")
@@ -316,7 +370,4 @@ class CoefficientModel(nn.Module):
         body = self.image_encoder.project(torch.cat([pooled[n] for n in VIEWS[:4]]))
         features = list(body.chunk(4))
         features.append(self.bottom_encoder.project(pooled["bottom"]))
-        condition = self.parameter_encoder(parameters)
-        if self.view_attention is not None:
-            features, _ = self.view_attention(features, condition)
-        return torch.cat((*features, condition), dim=1)
+        return self._fuse_views(features, parameters, scene)

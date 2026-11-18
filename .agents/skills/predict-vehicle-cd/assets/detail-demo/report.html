@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>轮辋改型 · 细节影响核验</title>
+  <style>__CSS__</style>
+</head>
+<body>
+  <main>
+    <header>
+      <div class="eyebrow">VEHICLE AERODYNAMICS / 可核验演示</div>
+      <h1>轮辋改型，对整车系数影响多少？</h1>
+      <p class="lead">完整车身保持一致，四轮同步更换轮辋方案。将模型预测与相同工况的源 CFD 逐项对照。</p>
+      <div class="tags"><span>完整五视图输入</span><span>共享 Cd / Cl 头</span><span>真实配对 CFD</span><span>历史测试 · 同一车族</span></div>
+    </header>
+    <section class="controls panel" aria-label="案例和系数选择">
+      <label>改型案例<select id="query"></select></label>
+      <label>查看系数<select id="target"><option value="0">Cd · 阻力系数</option><option value="1">Cl · 升力系数</option></select></label>
+      <label>图表中的模型<select id="model"><option>A0</option><option>A1</option><option selected>A2</option></select></label>
+      <div class="conditions">140 km/h · 0°偏航 · 运动地面 · 旋转轮胎<br>Sref 2.16 m² · Re 约 1.19×10⁷ <small>（空气性质假设下估算）</small></div>
+    </section>
+    <section class="metrics" aria-label="当前案例的系数变化">
+      <article><div>源 CFD 的改型差值</div><strong id="true-delta">—</strong><small id="true-relative">—</small></article>
+      <article><div id="pred-title">A2 预测的差值</div><strong id="pred-delta">—</strong><small>修改方案 − 基准方案</small></article>
+      <article><div>当前案例差值绝对误差</div><strong id="error">—</strong><small id="direction">—</small></article>
+      <article><div>全部 92 个历史查询的差值 MAE</div><strong id="mae">—</strong><small id="direction-overall">—</small></article>
+    </section>
+    <section class="panel geometry">
+      <div class="section-title"><div><h2>同一辆车，改变整套轮组方案</h2><p>蓝色标记轮组几何，代表改动位置；颜色没有气动力大小含义。</p></div><button id="reset">重置视角</button></div>
+      <div class="viewer-grid">
+        <article><div class="viewer-heading"><strong id="base-title">基准 · Rim0001</strong><span>train / 允许的 CFD 锚点</span></div><div class="viewer" id="base-view"></div></article>
+        <article><div class="viewer-heading"><strong id="query-title">改型</strong><span>historical test / 未用于此次训练</span></div><div class="viewer" id="query-view"></div></article>
+      </div>
+      <div class="viewer-tools"><label>车身不透明度 <input id="opacity" type="range" min="0.05" max="1" value="1" step="0.05"></label><span>拖动旋转 · 滚轮缩放 · 两侧相机同步</span><span id="mesh-count"></span></div>
+      <div id="viewer-status" role="status">正在加载完整车辆预览…</div>
+    </section>
+    <section class="panel">
+      <div class="section-title"><div><h2>逐例对照：CFD、预测差值与基准锚定</h2><p>所有方法使用相同的基准 CFD 值。锚定系数 = 基准 CFD 系数 + 预测差值。</p></div><button id="download-csv">下载全部查询 CSV</button></div>
+      <div class="table-scroll"><table id="case-table"><thead><tr><th>方法</th><th>基准值</th><th>改型值</th><th>改型差值</th><th>锚定后系数</th><th>差值误差</th></tr></thead><tbody></tbody></table></div>
+      <p class="note">A0：冻结的当前模型；A1：继续绝对系数训练；A2：相同初始化、样本对和预算，增加差值监督。A1/A2 均完成 12 轮，按相同验证规则选权重。训练不使用测试查询标签。</p>
+    </section>
+    <section class="analysis-grid">
+      <article class="panel"><div class="section-title"><div><h2>全部 92 个查询，预测与 CFD 是否一致？</h2><p>每个点是一套未用于此次训练的轮组方案；圆环标出当前展示案例。</p></div></div><div id="scatter"></div><p class="note">横轴：源 CFD 差值；纵轴：模型差值。虚线为理想一致线；接近水平线说明模型响应幅度不足。</p></article>
+      <article class="panel"><h2>同预算训练对照</h2><div class="table-scroll"><table id="summary-table"><thead><tr><th>方法</th><th>差值 MAE</th><th>方向正确率</th><th>响应标准差 / CFD</th></tr></thead><tbody></tbody></table></div><div id="finding" class="finding"></div><p class="note">零变化基线始终输出零差值；训练均值基线直接输出720个训练轮组的平均系数，两者均不感知几何。单种子、历史同车族评估；表中小误差和方向仍受源 CFD 精度限制。</p></article>
+    </section>
+    <section class="panel">
+      <div class="section-title"><div><h2>完整五视图：模型实际看见了哪些变化？</h2><p>从上到下：基准输入、改型输入、像素变化区域。蓝色只标记输入变化，不是压力、注意力或气动力贡献。</p></div><span id="pixel-count" class="pill"></span></div>
+      <img id="input-image" alt="前后右上下五个完整视图的基准、改型和输入差异" width="1280" height="868">
+    </section>
+    <section class="panel evidence">
+      <div class="section-title"><div><h2>核验依据</h2><p>可下载原始逐例结果与证据，不依赖展示页中的四舍五入数值。</p></div><button id="download-json">下载核验 JSON</button></div>
+      <ul id="checks"></ul>
+      <details><summary>数值自检、参考切换与推理耗时</summary><div id="controls-proof"></div></details>
+      <details><summary>证据边界与来源</summary><p>这里的“细节影响”指固定条件下，整套轮组方案改型引起的整车系数变化。没有将四轮变化拆成单个轮辐或单个车轮的物理贡献，也没有输出未经场数据支持的压力积分。</p><p>CFD 系数来自公开 DrivAerRim 固定版本，保留源四位小数精度。没有源 CFD 网格/迭代噪声区间，也没有改型风洞结果。Re 使用明确空气性质假设计算，未核实为源 CFD 的实际 Re。3D 预览经过简化，神经网络输入和源文件保持完整。</p><p><a href="https://huggingface.co/datasets/BeyondXia1212/DrivAerRim" target="_blank" rel="noopener">公开数据来源 · CC BY-NC 4.0</a></p><p id="radiant-status"></p></details>
+    </section>
+    <footer>保留原模型和默认接口 · 新权重仅作实验候选 · 注意力权重不解释为空气动力贡献</footer>
+  </main>
+  <script type="application/json" id="demo-data">__DATA__</script>
+  <script type="application/json" id="demo-geometry">__GEOMETRY__</script>
+  <script>__VTK__</script>
+  <script>__JS__</script>
+</body>
+</html>

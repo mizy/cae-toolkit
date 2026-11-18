@@ -75,3 +75,40 @@ def test_loader_reuses_geometry_across_conditions(tmp_path):
     assert a["front"].data_ptr() == b["front"].data_ptr()
     assert len(ds.cache) == 1
     assert not x.equal(y)
+
+
+@pytest.mark.parametrize(
+    "mode,expected", [("conditions", [14, 0.2, 0, 1]), ("design", [3, 14, 0.2, 0, 1])]
+)
+def test_explicit_condition_schema_preserves_reynolds_for_baselines(
+    tmp_path, mode, expected
+):
+    case = {
+        "parameters": [1, 0.2, 14, 0.2, 0, 1],
+        "condition_parameters": [14, 0.2, 0, 1],
+        "design_parameters": [3],
+        "targets": [0.2, 1.5],
+    }
+    stats = {
+        "parameter_mean": [0] * len(expected),
+        "parameter_std": [1] * len(expected),
+        "target_mean": [0, 0],
+        "target_std": [1, 1],
+    }
+    _, value, _ = AircraftCases(tmp_path, [case], stats, mode)[0]
+    np.testing.assert_array_equal(value.numpy(), np.asarray(expected, np.float32))
+
+
+def test_component_depth_composition_matches_complete_geometry():
+    from vehicle_cd_learning.prepare_drivaerrim import full_frame, merge_depth
+
+    a = pv.Box(bounds=(-0.5, 0.5, -0.2, 0.2, 0.1, 0.4)).triangulate()
+    b = pv.Box(bounds=(-0.25, 0.25, -0.3, 0.3, 0, 0.2)).triangulate()
+    origin = np.zeros(3)
+    composed = merge_depth(full_frame(a, origin, 1), full_frame(b, origin, 1))
+    complete = full_frame(a.append_polydata(b), origin, 1)
+    for view in VIEWS:
+        np.testing.assert_array_equal(composed[view].mask, complete[view].mask)
+        np.testing.assert_allclose(
+            composed[view].depth, complete[view].depth, atol=1e-6
+        )

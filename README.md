@@ -4,6 +4,8 @@ Personal toolkit for CAD-to-watertight-surface meshing, repair planning, tessell
 
 All logic lives inside **agent skills** under `.agents/skills/<skill-name>`. Each skill owns its `SKILL.md`, scripts, references, assets, and documentation.
 
+车辆与飞机气动系数的实际训练来源、样本划分和未训练候选，见[训练数据清单](.agents/skills/cad-surface-mesher/docs/aerodynamic-training-datasets.md)。
+
 ## Skills
 
 ### predict-vehicle-cd

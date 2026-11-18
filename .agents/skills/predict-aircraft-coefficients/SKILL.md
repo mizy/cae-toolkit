@@ -5,10 +5,38 @@ description: Train and evaluate aircraft Cd and Cl coefficient predictors from c
 
 # Aircraft coefficient learning
 
+For actual vehicle/aircraft training sources, splits and downloaded-only candidates,
+read [the training data inventory](../cad-surface-mesher/docs/aerodynamic-training-datasets.md).
+
 Initial scope is low-speed COCOANet CCA-family CFD coefficients (source velocity
 at most 80 m/s and zero sideslip). The raw pinned CSV has 3,513 rows; this is not
 the data card's advertised 3,570. Geometry-disjoint validation/tests measure new
 parameterized shapes within this family, not arbitrary aircraft configurations.
+
+For the separate CRM-HL high-lift dataset, use `aircraft_learning.prepare_hilift`
+and the existing trainer with its explicit Re/Mach condition schema. See
+[the public-data expansion record](../cad-surface-mesher/docs/aerodynamic-data-expansion-20261109.md)
+for source hashes, half-airframe mirroring, geometry-held-out splits and results.
+These checkpoints have their own input contract; the COCOANet prediction CLI
+continues to accept only its original seven-parameter schema.
+
+For the completed joint vehicle/aircraft scene A/B/C experiment, read
+[the scene-conditioning record](../cad-surface-mesher/docs/aerodynamic-scene-conditioning-plan.md).
+Its concrete entry points are `aircraft_learning.prepare_scenes`,
+`scene_experiment freeze/train`, and `compare_scenes`; the existing trainer and
+complete-view model are reused. Experimental 40-input checkpoints have a separate
+contract and do not replace the original predictors.
+
+For the separately prepared2026-11-16 dimensionless joint dataset and explicitly
+assumed COCOANet Reynolds completion, read the [completion record](../predict-vehicle-cd/references/learning-label-completion.md).
+User-authorized ISA/Sutherland estimates remain marked as estimates; old aircraft
+checkpoints and source labels are unchanged.
+
+The subsequent [full-pool online-jitter experiment](../predict-vehicle-cd/references/learning-online-jitter-full-pool.md)
+uses this completed36-field joint dataset in two single-seed six-epoch runs.
+All4,121 train records supervise an auxiliary coefficient readout on the Rim B
+shared CNN. Aircraft sampling results remain mixed and no candidate passed all
+validation gates; existing aircraft and joint A defaults remain separate.
 
 The input is complete STL geometry with explicit source axes and units, alpha,
 velocity and altitude. Source geometry is nTop mm, body X (nose toward -X), span Y

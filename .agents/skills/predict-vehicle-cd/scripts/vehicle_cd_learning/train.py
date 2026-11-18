@@ -44,14 +44,20 @@ def masked_mse_loss(prediction, targets):
     return nn.functional.mse_loss(prediction[observed], targets[observed])
 
 
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, balance_scenes=False):
     model.eval()
     total, count, case_count, errors = 0.0, 0, 0, []
     target_counts = np.zeros(model.target_count, dtype=np.int64)
+    scene_totals, scene_counts = {}, {}
     with torch.no_grad():
         for batch in loader:
-            views, parameters, targets = move_batch(batch, device)
-            prediction = model(views, parameters)
+            views, parameters, targets = move_batch(batch[:3], device)
+            scene = batch[3].to(device) if len(batch) == 4 else None
+            prediction = (
+                model(views, parameters, scene)
+                if scene is not None
+                else model(views, parameters)
+            )
             if not torch.isfinite(prediction).all():
                 raise FloatingPointError("nonfinite model output during evaluation")
             observed = torch.isfinite(targets)
@@ -62,6 +68,21 @@ def evaluate(model, loader, device):
             error = (prediction - targets).cpu().numpy()
             error[~observed.cpu().numpy()] = np.nan
             errors.append(error)
+            if balance_scenes:
+                if scene is None:
+                    raise ValueError("Scene-balanced evaluation requires scene IDs")
+                for identity in torch.unique(scene).tolist():
+                    selected = (scene == identity)[:, None] & observed
+                    scene_totals[identity] = (
+                        scene_totals.get(identity, 0.0)
+                        + (prediction[selected] - targets[selected])
+                        .square()
+                        .sum()
+                        .item()
+                    )
+                    scene_counts[identity] = scene_counts.get(identity, 0) + int(
+                        selected.sum()
+                    )
     if not count:
         reason = (
             "validation split is empty"
@@ -69,7 +90,12 @@ def evaluate(model, loader, device):
             else "validation has no observed targets"
         )
         raise ValueError(reason)
-    return total / count, np.concatenate(errors), target_counts
+    loss = (
+        np.mean([scene_totals[k] / scene_counts[k] for k in scene_totals])
+        if balance_scenes
+        else total / count
+    )
+    return float(loss), np.concatenate(errors), target_counts
 
 
 def training_normalization(parameters, targets, target_names):
@@ -148,6 +174,9 @@ def train_model(
     preload: bool = False,
     encoder_checkpoint: Path | None = None,
     view_feature_size: int | None = None,
+    scene_mode: str = "none",
+    scene_dropout: float = 0.0,
+    train_sampler=None,
 ) -> Path:
     """Train normalized CaseDataset splits and save the best validation checkpoint."""
     if not len(train_set) or not len(validation_set):
@@ -158,6 +187,8 @@ def train_model(
         raise ValueError("workers must be nonnegative")
     if preload and workers:
         raise ValueError("preload uses the main process; set workers=0")
+    if not 0 <= scene_dropout < 1:
+        raise ValueError("scene_dropout must be within [0,1)")
     target_names = target_names or ["cd", "cl"]
     if not target_names or any(name not in {"cd", "cl"} for name in target_names):
         raise ValueError("target_names must be cd, cl, or [cd, cl]")
@@ -197,7 +228,8 @@ def train_model(
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         generator=torch.Generator().manual_seed(seed),
         num_workers=workers,
         persistent_workers=workers > 0,
@@ -209,6 +241,7 @@ def train_model(
         persistent_workers=workers > 0,
     )
     jitter_generator = torch.Generator(device=device).manual_seed(seed + 1)
+    scene_generator = torch.Generator(device=device).manual_seed(seed + 2)
     initial_rng = torch.get_rng_state()
     model = CoefficientModel(
         len(parameter_names),
@@ -218,8 +251,9 @@ def train_model(
         encoder=encoder,
         fusion=fusion,
         view_feature_size=view_feature_size,
+        scene_mode=scene_mode,
     ).to(device)
-    if view_feature_size is not None:
+    if view_feature_size is not None or scene_mode != "none":
         # Pair unchanged tensors across widths; only dimension-dependent layers differ.
         after_rng = torch.get_rng_state()
         torch.set_rng_state(initial_rng)
@@ -237,6 +271,13 @@ def train_model(
             if model.state_dict()[k].shape == v.shape
         }
         model.load_state_dict(shared, strict=False)
+        if scene_mode != "none":
+            with torch.no_grad():
+                weight = model.parameter_encoder[0].weight
+                weight[:, : len(parameter_names)].copy_(
+                    reference.parameter_encoder[0].weight
+                )
+                weight[:, len(parameter_names) :].zero_()
         del reference
         torch.set_rng_state(after_rng)
     encoder_initialization = {"mode": "random", "loaded_modules": [], "loaded_keys": []}
@@ -297,6 +338,17 @@ def train_model(
             common_hash.update(key.encode())
             common_hash.update(value.detach().cpu().contiguous().numpy().tobytes())
         width_initialization = {"common_initial_sha256": common_hash.hexdigest()}
+    scene_initialization = {}
+    if metadata.get("scene_experiment"):
+        common_hash = hashlib.sha256()
+        for key, value in sorted(model.state_dict().items()):
+            if key.startswith(("scene_embedding.", "scene_film.")):
+                continue
+            if key == "parameter_encoder.0.weight":
+                value = value[:, : len(parameter_names)]
+            common_hash.update(key.encode())
+            common_hash.update(value.detach().cpu().contiguous().numpy().tobytes())
+        scene_initialization = {"scene_common_initial_sha256": common_hash.hexdigest()}
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     best_loss, best_error, history = float("inf"), None, []
 
@@ -306,11 +358,22 @@ def train_model(
         train_total, train_count = 0.0, 0
         train_target_counts = torch.zeros(len(target_names), dtype=torch.int64)
         for batch in train_loader:
-            views, parameters, targets = move_batch(batch, device)
+            views, parameters, targets = move_batch(batch[:3], device)
+            scene = batch[3].to(device) if len(batch) == 4 else None
+            if scene is not None and scene_mode != "none" and scene_dropout:
+                scene = scene.masked_fill(
+                    torch.rand(scene.shape, generator=scene_generator, device=device)
+                    < scene_dropout,
+                    0,
+                )
             if augment:
                 views = jitter_views(views, jitter_generator)
             optimizer.zero_grad(set_to_none=True)
-            prediction = model(views, parameters)
+            prediction = (
+                model(views, parameters, scene)
+                if scene is not None
+                else model(views, parameters)
+            )
             if not torch.isfinite(prediction).all():
                 raise FloatingPointError(f"nonfinite model output at epoch {epoch + 1}")
             observed = torch.isfinite(targets)
@@ -335,7 +398,12 @@ def train_model(
                 f"training targets have no observed values: {', '.join(missing)}"
             )
         train_loss = train_total / train_count
-        val_loss, val_error, val_target_counts = evaluate(model, val_loader, device)
+        val_loss, val_error, val_target_counts = evaluate(
+            model,
+            val_loader,
+            device,
+            balance_scenes=metadata.get("scene_experiment", False),
+        )
         if not np.isfinite(val_loss):
             raise FloatingPointError(f"nonfinite validation loss at epoch {epoch + 1}")
         history.append(
@@ -343,6 +411,7 @@ def train_model(
         )
         if (
             view_feature_size is not None
+            or metadata.get("scene_experiment")
             or (epoch + 1) % 10 == 0
             or epoch + 1 == epochs
         ):
@@ -352,7 +421,7 @@ def train_model(
                 f"{metric_name}={val_loss:.6g}",
                 flush=True,
             )
-            if view_feature_size is not None:
+            if view_feature_size is not None or metadata.get("scene_experiment"):
                 print(
                     f"epoch_seconds={time.perf_counter() - epoch_started:.2f}",
                     flush=True,
@@ -370,6 +439,7 @@ def train_model(
                     "size": model_size,
                     "encoder": encoder,
                     "fusion": fusion,
+                    **({"scene_mode": scene_mode} if scene_mode != "none" else {}),
                     **(
                         {"view_feature_size": view_feature_size}
                         if view_feature_size is not None
@@ -380,6 +450,12 @@ def train_model(
                 "augmentation": "sampling_jitter_v1" if augment else "none",
                 "encoder_initialization": encoder_initialization,
                 **width_initialization,
+                **scene_initialization,
+                **(
+                    {"scene_dropout": scene_dropout, "scene_experiment": True}
+                    if metadata.get("scene_experiment")
+                    else {}
+                ),
                 "parameter_names": parameter_names,
                 "target_names": target_names,
                 "parameter_mean": normalization["parameter_mean"],
@@ -436,6 +512,12 @@ def train_model(
         "augmentation": "sampling_jitter_v1" if augment else "none",
         "encoder_initialization": encoder_initialization,
         **width_initialization,
+        **scene_initialization,
+        **(
+            {"scene_mode": scene_mode, "scene_dropout": scene_dropout}
+            if metadata.get("scene_experiment")
+            else {}
+        ),
         "parameter_count": sum(p.numel() for p in model.parameters()),
         "train_count": len(train_set),
         "validation_count": len(validation_set),

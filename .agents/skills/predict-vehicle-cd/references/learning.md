@@ -1,5 +1,35 @@
 # Five-view aerodynamic coefficient learning
 
+The [independent-sampling evaluation](learning-stability-first.md) finds that the retained model can reverse a real wheel change when the reference and query use independently sampled raw depth images. The report includes a same-car counterexample, a comparison with earlier end-to-end CNN training, and the original vehicle, aircraft and mirror replays. Zero drift on registered rays measures renderer repeatability.
+
+The [absolute coefficients and design-change audit](learning-absolute-and-design-change.md) measures the retained fifth epoch on whole-vehicle Cd/Cl, matched wheel replacements, a five-level mirror deformation and independently shifted views. It includes same-ID absolute baselines, a calibrated fixed-reference Rim estimate, and the resolution of small signed drag changes against CFD.
+
+The [retained-epoch5 Cl diagnosis](learning-cl-sampling-diagnosis.md) adds validation-only component/view interventions and train-only gradient checks. Positive horizontal sampling errors are amplified by the paired readout despite lower average CNN feature variation. Weak-ridge and bounded Cl-row repairs improve some phases but fail joint per-phase protection, so epoch5 remains the starting point. The wider readout experiment proposed there is covered by the sampling stability validation.
+
+The [full-pool online image-jitter comparison](learning-online-jitter-full-pool.md) completed two six-epoch continuations with all4,121 vehicle/aircraft train records and seed42. An auxiliary real-label coefficient readout updates B's shared CNN while matched Rim pairs retain delta supervision. Online jitter gives mixed raw-render phase results, worsens Cl sensitivity at the main phase and weakens amplitude versus the matched control; no candidate passes all gates. The user subsequently chose to retain online epoch5 as the starting point for further experiments (`retained-online.pt`, `retention.json`), with original B kept for comparison. Auxiliary absolute outputs are evaluated separately from B's delta capability.
+
+The [sampling-consistency repair](learning-sampling-consistency.md) adds a canonical source-geometry entry point and records three completed six-epoch continuations. None passed the joint sampling-stability and real-response gates, so B is retained. Re-rendering into a common frame preserves its original predictions and removes upstream phase differences at that input boundary; bare-network phase robustness and nominal aerodynamic error remain unresolved.
+
+The [single-run delta factorial](learning-delta-factorial.md) shifts the objective to same-condition ΔCd/ΔCl: genuine256/512 inputs crossed with native8/16 spatial pooling, matched initialization and executed pair exposure. B(512/8) wins validation and the fixed-reference mean errors, with stronger Cd response than the tested Radiant SDF package. Unseen-to-unseen Cl and camera-sampling stability remain weak; this does not promote a generic production predictor.
+
+The [2026-11-17 repair comparison](learning-accuracy-repair-20261117.md) tests paired CNN source-gradient projection, parameter averaging and a unified multiscale residual. Six continuations completed; projection/averaging did not pass the joint validation gates. The retained neural base plus a Cl-only residual slightly lowers aggregate Cl MAE, leaves Cd unchanged and still worsens Windsor Cl. It does not replace the previously stronger standalone Rim Cd candidate or establish a generalization fix.
+
+The [completed three-seed end-to-end and multiscale comparison](learning-end-to-end-radiant.md) adds train-side geometry-permutation evidence and current source-gradient measurements. The validation-selected neural ensemble improves aggregate Cd/Cl point estimates; a separate multiscale readout gives lower anchored Cd MAE than the tested Radiant SDF package on all three fixed references and exceeds a zero-geometry-response control. These are distinct candidates, with source regressions and known-family evaluation limits recorded. Original defaults remain available.
+
+The [fixed-baseline pre-compression readout validation](learning-kernel-readout.md) clarifies the scope of the earlier27% Rim-only result and tests the corresponding5120-feature route across the vehicle cohort. Both historical-test MAE point estimates improve slightly, but paired uncertainty includes zero and some sources regress. Keep the previously retained absolute-MAE candidate as the working baseline; no default promotion occurred. The document defines the next paired end-to-end validation and marks it as not yet run.
+
+For the current vehicle A candidate, use the [dimensionless input entry point](learning-dimensionless-input.md): Re is supplied directly, absolute speed/length features are removed, and preparation/training/inference share the 18-value plus18-mask contract. The legacy5/9-value contracts described below remain available with their original checkpoints.
+
+The [absolute Cd/Cl readout experiment](learning-absolute-readout.md) follows the user's current absolute-error-only priority. A simple MAE-continuation checkpoint is available through the original dimensionless loader as an exploratory candidate; per-source regressions are reported and the old default is preserved. Feature normalization/balancing did not establish stable Cl improvement.
+
+The [shared coefficient-head comparison](learning-head-variants.md) separately tests original-head continuation, linear/MLP/normalized corrections and RBF on the same frozen fused features. RBF wins validation within this experiment but does not surpass the retained prior continuation on both historical-test MAEs; default weights remain unchanged.
+
+The [2026-11-16 completion record](learning-label-completion.md) documents separate vehicle and joint datasets: 930 vehicle plus 1497 aircraft Re estimates, with 26 audit-only Cl pseudo-labels. Observed supervision and frozen checkpoints remain unchanged.
+
+The [paired-detail demonstration](learning-detail-contribution.md) includes matched A1/A2 continuation, fixed-reference and all-query pair metrics, full source-geometry replay, and an offline interactive CFD comparison. The current delta-loss candidate is not promoted: its response remains weak and results depend on the reference.
+
+The [subsequent detail diagnosis and external-model comparison](learning-radiant-detail-diagnosis.md) adds frozen-stage information probes, train-only gradient measurements and actual cached Radiant SDF predictions on the same92 queries. This is a raw-source model-level comparison, with unverified external training exposure/live identity; it does not rank architectures under equal training data.
+
 ## Scope and architecture
 
 Predict mean Cd and Cl directly from orthographic numerical depth/mask views and

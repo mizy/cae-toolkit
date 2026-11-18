@@ -5,6 +5,9 @@ description: Estimate a vehicle drag coefficient (Cd) from an arbitrary 3D car m
 
 # Predict Vehicle Cd
 
+For the verified vehicle/aircraft training membership and downloaded-only sources,
+read [the training data inventory](../cad-surface-mesher/docs/aerodynamic-training-datasets.md).
+
 Estimate Cd from a 3D vehicle mesh with the packaged side-view reference library. The predictor accepts raw vehicle meshes and first normalizes them to the project vehicle convention: length on `X`, width on `Y`, height on `Z`, top at `+Z`, front target `-X`, meters-scale dimensions, and ground at `z = 0`. Treat the result as a fast shape-similarity prior for triage, candidate ranking, or sanity checks before higher-fidelity CFD/model inference.
 
 ## Quick Start
@@ -89,6 +92,8 @@ a separate baseline; its mixed-condition reference labels are exploratory data,
 not matched-condition CFD truth. Install optional `requirements-learning.txt`.
 
 For public geometry/coefficient collection, read `references/public-datasets.md`.
+For selective DrivAerRim acquisition and complete-car reconstruction, read
+[the public-data expansion record](../cad-surface-mesher/docs/aerodynamic-data-expansion-20261109.md).
 For the early physics-only conditional flow experiments, read
 `references/physics-flow-prototype.md`. These are two-dimensional analytical
 verification cases, not vehicle-flow models or substitutes for CFD.
@@ -99,6 +104,53 @@ For full-view detail pooling, optional condition-dependent view attention and th
 frozen-split comparison command, read `references/learning-cnn-design.md`.
 For the paired 32/128 per-view compression experiment with a shared Cd/Cl head,
 read `references/learning-feature-width.md`.
+For the current absolute-Cd/Cl-only readout continuation, compatible candidate
+checkpoint and per-source regressions, read `references/learning-absolute-readout.md`.
+For the separate fixed-encoder head-architecture and RBF correction comparison,
+read `references/learning-head-variants.md`; previous readout arms kept the same head.
+For the fixed-baseline pre-compression comparison, the scope of the earlier27%
+Rim result and the next accuracy-validation protocol, read
+`references/learning-kernel-readout.md`.
+For the completed three-seed full-network continuation, geometry-use diagnosis,
+multiscale readout and same-reference absolute-Cd comparison with Radiant, read
+`references/learning-end-to-end-radiant.md`. Keep the overall validation winner
+separate from the candidate with the best observed Rim detail result.
+For the subsequent source-gradient/parameter-averaging repair attempts and the
+unified coefficient-correction entry point, read
+`references/learning-accuracy-repair-20261117.md`; its small Cl improvement does
+not resolve the Rim Cd or Windsor generalization issues.
+For the later single-run256/512 ×8/16 paired-delta comparison, native512 inputs,
+direction/amplitude evaluation and the sampling-sensitivity counterexample,
+read `references/learning-delta-factorial.md`. Its B candidate predicts deltas,
+and keeps the existing absolute-coefficient entry points separate.
+For the completed sampling-consistency continuations and canonical geometry
+inference entry point, read `references/learning-sampling-consistency.md`.
+All three learned continuations failed the joint preservation/stability gates;
+keep B. The new entry re-renders source geometry into a shared canonical frame;
+it does not establish invariance of the bare network to arbitrary shifted images.
+For the later single-seed online image-jitter comparison on all4,121 vehicle and
+fixed-wing training records, read `references/learning-online-jitter-full-pool.md`.
+Both six-epoch arms completed. The auxiliary coefficient readout shares B's CNN;
+Rim deltas still use the original pair head. Raw-render sampling improvements are
+mixed, including worse Cl sensitivity. Per the user's later decision, retain
+online epoch5 as the next experiment's starting point through
+`outputs/aerodynamic-online-jitter-20261117/retained-online.pt` and `retention.json`.
+Keep original B as the comparison baseline and retain all measured regressions.
+For the retained-epoch5 Cl investigation, read
+`references/learning-cl-sampling-diagnosis.md`. Validation interventions locate
+direction-dependent bottom-view sensitivity and amplification in the pair adapter,
+hidden readout and Cl row. Two row-only repairs fail joint per-phase preservation;
+the continuation checkpoint stays `retained-online.pt`.
+For stability-first geometry input and the completed broader phase experiment,
+read [the sampling stability validation](references/learning-stability-first.md).
+`vehicle_cd_learning.registered_prediction` runs the retained checkpoint on a
+shared physical sampling grid. Zero drift on that grid measures renderer
+repeatability. The retained weights and the tested continuations still fail
+on independently sampled raw views of the same wheel geometry.
+For the auditable complete-car wheel-assembly change demo, paired continuation,
+and prediction-versus-source-CFD delta checks, read
+`references/learning-detail-contribution.md`; changes in prediction or input pixels
+do not certify physical part-force contributions.
 Keep matched-condition CFD pools separate from the assumed-condition reference
 pool. A geometry-disjoint split within one base family must be reported as such.
 Read `references/learning-full-attention.md` for full-source collection, exact

@@ -36,10 +36,12 @@ class AircraftCases(Dataset):
             values = case["parameters"]
         elif self.mode == "design":
             views = {}
-            values = case["design_parameters"] + case["parameters"][3:]
+            values = case["design_parameters"] + case.get(
+                "condition_parameters", case["parameters"][3:]
+            )
         else:
             views = {}
-            values = case["parameters"][3:]
+            values = case.get("condition_parameters", case["parameters"][3:])
         x = (np.array(values) - self.stats["parameter_mean"]) / self.stats[
             "parameter_std"
         ]
@@ -116,7 +118,10 @@ def evaluate(checkpoint_path, data, root, mode, splits=("val", "test")):
         "checkpoint": str(checkpoint_path.resolve()),
         "checkpoint_sha256": hashlib.sha256(checkpoint_path.read_bytes()).hexdigest(),
         "best_epoch": ck["epoch"],
-        "scope": "Unseen geometry within one CCA family, source CFD coefficients; no arbitrary aircraft-family or flight-condition extrapolation claim",
+        "scope": data.get(
+            "scope",
+            "Unseen geometry within one CCA family, source CFD coefficients; no arbitrary aircraft-family or flight-condition extrapolation claim",
+        ),
         "splits": result,
     }
 
@@ -131,6 +136,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="mps")
+    parser.add_argument("--encoder-checkpoint", type=Path)
     args = parser.parse_args()
     data = json.loads((args.prepared / "dataset.json").read_text())
     owners = {}
@@ -157,27 +163,31 @@ def main():
     names = (
         data["parameter_names"]
         if args.mode == "views"
-        else data["design_names"] + data["parameter_names"][3:]
+        else data["design_names"]
+        + data.get("condition_names", data["parameter_names"][3:])
         if args.mode == "design"
-        else data["parameter_names"][3:]
+        else data.get("condition_names", data["parameter_names"][3:])
     )
     x = [
         c["parameters"]
         if args.mode == "views"
-        else c["design_parameters"] + c["parameters"][3:]
+        else c["design_parameters"] + c.get("condition_parameters", c["parameters"][3:])
         if args.mode == "design"
-        else c["parameters"][3:]
+        else c.get("condition_parameters", c["parameters"][3:])
         for c in train
     ]
     y = [c["targets"] for c in train]
     stats = training_normalization(x, y, ["cd", "cl"])
     metadata = {
         "render_config": data["render_config"],
-        "conditions": {
-            "beta_deg": 0,
-            "velocity_max_m_s": 80,
-            "source": "COCOANet declared velocity, altitude, alpha; Re and Mach not inferred without verified source atmosphere",
-        },
+        "conditions": data.get(
+            "training_conditions",
+            {
+                "beta_deg": 0,
+                "velocity_max_m_s": 80,
+                "source": "COCOANet declared velocity, altitude, alpha; Re and Mach not inferred without verified source atmosphere",
+            },
+        ),
         "parameter_ranges": {
             k: [
                 float(v)
@@ -198,7 +208,7 @@ def main():
             {data["geometry"][c["geometry_id"]]["sha256"] for c in train}
         ),
         "heldout_ids": [c["case_id"] for c in data["cases"] if c["split"] != "train"],
-        "train_family_ids": ["cocoanet-cca"],
+        "train_family_ids": sorted({c["family_id"] for c in train}),
         "split_policy": "geometry_disjoint",
         "dataset_sha256": hashlib.sha256(
             (args.prepared / "dataset.json").read_bytes()
@@ -223,6 +233,7 @@ def main():
         encoder="pyramid_detail_attention" if args.mode == "views" else "plain",
         fusion="attention" if args.mode == "views" else "concat",
         preload=True,
+        encoder_checkpoint=args.encoder_checkpoint,
     )
     result = evaluate(checkpoint, data, args.prepared, args.mode)
     (args.output_dir / "evaluation.json").write_text(
