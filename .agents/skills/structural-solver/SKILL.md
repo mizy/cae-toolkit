@@ -1,6 +1,6 @@
 ---
 name: structural-solver
-description: Linear static structural analysis (stiffness k = F/delta) with deformation visualization for watertight CAD/mesh parts. Builds a tetrahedral volume mesh (T10) from parametric geometry, solves the linear elastic FE system with scipy, and emits deformed_mesh.vtp (displaced geometry + displacement/von-Mises point arrays), a JSON report, and a self-contained HTML report with embedded before/after deformation renderings, field plots, analytical benchmark validation, and pass/fail gates. Use when the user needs static stiffness, deformation, or stress for a part.
+description: Linear static structural analysis and deformation visualization for tetrahedral solids and planar triangular thin shells. Use when the user needs static stiffness, deformation, or stress for a part. The solid and shell CLI paths return JSON and VTP fields, and the solid path also emits an HTML report.
 ---
 
 # Structural Solver
@@ -29,9 +29,9 @@ GPU path for T10 when the native binary exists; explicit `gpu` fails on errors,
 the Python path through the legacy CLI. Build both Rust packages after checkout;
 binaries and generated WASM are not committed.
 
-The supported physical model remains solid, small-strain, linear isotropic
-elasticity. Shell/beam elements, midsurface extraction, arbitrary CAD input and
-automatic mesh-convergence refinement are not yet implemented.
+The physical model uses small-strain linear isotropic elasticity. The thin-shell
+case below uses the Python CPU solver. Beam elements, automatic midsurface
+extraction and arbitrary CAD input are outside the supported CLI inputs.
 
 ## Quick Start
 
@@ -66,6 +66,87 @@ Outputs in `outputs/hinge/`:
 - `--mesh file.msh` (existing gmsh MSH 2.2 tetrahedral mesh)
 
 Units: `--units m` (m/N/Pa) or `--units mm` (mm/N/MPa). Internally SI.
+
+## 3D HTML postprocessing
+
+Generate a self-contained HTML report from a solved VTP surface or VTU volume:
+
+```bash
+../../../.venv/bin/python scripts/solve.py postprocess \
+  --mesh outputs/hinge/hinge_mesh.vtp --mesh-units m --units mm \
+  --summary outputs/hinge/hinge_report.json --output outputs/hinge/hinge_3d.html
+```
+
+Use the original geometry with its result fields. `--units` specifies the
+stored field units (m/Pa or mm/MPa), and `--mesh-units` defaults to the field
+length unit. The solid solver's original VTP has coordinates in meters
+and displacement in the requested units. The shell solver's original VTP
+uses the requested length units for both. Supply a 3-component point
+array named `displacement` or `u_mm` (for mm), and optional von Mises fields
+on points or cells, or open a VTP with scalar or vector fields only. The report can
+also show signed displacement components and any stored
+`vertical_mm`, `axial_mm`, or stress components. New solid outputs carry the
+six Voigt stress components and a geometry scale on displaced outputs.
+The postprocessor uses that metadata to restore the original coordinates
+and derives principal stresses when the tensor is available.
+
+Open the report in a WebGL-capable browser. It embeds its data and viewer,
+starts at 1× deformation, and supports rotation, zoom, cutaway views, original
+geometry overlay, animation, peak location, point/cell inspection, model-space
+distance, PNG export, and full-range or P99 color scales. A VTP cutaway clips
+the existing surface. Add `--volume-sections` for a tetrahedral VTU to embed
+interior field samples along X, Y and Z at five positions per axis. That option
+increases the report size. Stored numeric point and cell arrays can be selected
+in the field menu. Switch surface, wireframe or points, isolate triangles by
+threshold, or draw an isoline on a continuous point field. Point thresholds use
+triangle vertex averages. Include repeatable `--conclusion` arguments to place
+engineering findings at the top of the report. This command performs
+postprocessing only.
+
+## Planar thin shell
+
+```bash
+../../../.venv/bin/python scripts/solve.py shell \
+  --mesh plate-midsurface.vtp --units mm --thickness 0.4 \
+  --young-modulus 2000 --poisson-ratio 0.38 \
+  --fix x_min --load "x_max: fz=-0.001" \
+  --output-dir outputs/plate --name plate
+```
+
+Supply one planar triangular midsurface as VTP or STL, with connected mesh
+vertices and uniform thickness. The plane can have any 3D orientation. Cutouts
+can be represented as mesh boundaries. `--fix` clamps endpoint translations
+and the midpoint normal slope on each selected boundary edge. `--load` applies a total force
+in N, distributed uniformly per unit edge length in the global directions
+`fx/fy/fz`. Select bounding edges with `x_min` etc., or name a VTP scalar
+point array of 0/1 values. An edge is selected when both endpoints are tagged.
+Both flags can be repeated. Choose a material preset with `--material` or supply
+Young's modulus and Poisson's ratio as in the example.
+
+This path assembles constant-strain triangular membrane elements and quadratic
+Morley Kirchhoff–Love bending elements. Bending uses three corner displacements
+and one normal slope per edge. It has no transverse shear term, so a thin
+plate does not require tetrahedra through its thickness or suffer transverse
+shear locking in this model.
+[Morley's constant-moment plate-bending element](https://journals.sagepub.com/doi/10.1243/03093247V061020)
+
+The JSON report records force balance, free-DOF residual and energy consistency.
+The two VTP files carry translations and magnitudes as point data, with top,
+bottom and maximum von Mises stress as cell data. Geometry and displacement
+fields use the requested length units. The report records the normal defining
+the top face. The deformed geometry defaults to 1×, using the vertex
+displacements to draw the midsurface.
+
+Use this model for small displacement and rotation in a thin, planar patch.
+This CLI treats the patch as a stand-alone part. Curved shells, shell–solid
+coupling, contact, transverse shear, gravity and face pressure are outside the
+current shell path. A mixed-thickness assembly still uses the solid workflow.
+
+The shell regression uses a 200 × 20 × 0.4 mm strip with E = 2000 MPa and ν = 0.
+A 4 μN transverse end force gives 0.050012 mm with 720 triangles and 2,427 DOFs,
+compared with 0.050000 mm from the thin cantilever solution. The membrane
+regression checks axial displacement and stress on a rotated patch. Run both
+via `python -m pytest tests/test_shell.py`.
 
 ## Conventions and assumptions
 

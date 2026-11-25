@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>@@TITLE@@</title>
+<style>
+
+:root{font:14px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",sans-serif;color:#202e35;background:#f1f4f3;--line:#dce3e1;--accent:#12695d}
+*{box-sizing:border-box}body{margin:0}.report{max-width:1600px;margin:auto;padding:26px clamp(14px,3vw,50px) 40px}
+h1{font-size:clamp(22px,2.2vw,37px);letter-spacing:-.045em;line-height:1.22;margin:0 0 6px}
+.meta,.help,.note{color:#516562;font-size:13px;overflow-wrap:anywhere}.meta{margin:0}.note{margin:5px 0 0}.help{margin:8px 0 18px}
+.panel{display:grid;grid-template-columns:250px minmax(0,1fr);background:white;border:1px solid #c9d4d0;border-radius:15px;overflow:hidden;margin-top:17px;box-shadow:0 8px 25px #233c3310}
+.rail{padding:17px 16px;border-right:1px solid var(--line)}.rail h2,.filters summary,.conclusions h2{font-size:14px;letter-spacing:.025em;color:var(--accent);font-weight:700;margin:0 0 10px}
+.controls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-bottom:17px}
+.controls>label:has(select),.views,#range-custom,.filters label,#filter-note{grid-column:1/-1}
+label{display:flex;align-items:center;gap:6px;min-width:0}label:has(select){justify-content:space-between}
+select,input,button{font:inherit;max-width:100%;min-width:0}select,button,input[type=number]{border:1px solid #c7d4cf;background:white;color:#263c36;border-radius:6px;padding:5px 7px}
+select{width:71%}button{cursor:pointer}button:hover{background:#e9f3ee}button:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid #079280;outline-offset:2px}
+button[aria-pressed=true],#peak{background:var(--accent);color:white}.views{display:flex;flex-wrap:wrap;gap:4px}.views button{padding:4px;font-size:12px}
+label:has(#scale){white-space:nowrap}#scale{width:44px}input[type=number]{width:65px}input{accent-color:var(--accent)}[hidden]{display:none!important}button:disabled{opacity:.4;cursor:default}
+.filters{border-top:1px solid var(--line);padding-top:10px}.filters summary{cursor:pointer}.filters input[type=number]{margin-left:auto}
+.viewport{min-width:0;background:#111a25;color:#e9f1f4;display:flex;flex-direction:column}
+.stage{height:clamp(360px,53vh,720px);min-height:360px;flex:1 0 auto;position:relative;touch-action:none}.stage canvas{display:block}
+.view-label{position:absolute;z-index:1;top:14px;right:14px;background:#1a2938d9;border:1px solid #516475;border-radius:20px;padding:4px 11px;font:12px/1.5 ui-monospace,monospace;pointer-events:none}
+.legend,.status{padding:9px 16px;border-top:1px solid #293846}.legend-head,.ticks{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.ticks,#range-note{font:12px/1.5 ui-monospace,monospace;color:#b3c2ce}
+.ramp{height:7px;border-radius:4px;margin:5px 0}.status{margin:0;color:#bbcad6;font-size:13px}.failure{color:#ffa8a8}
+.findings{display:grid;grid-template-columns:2fr minmax(220px,1fr);gap:22px;align-items:start}
+.conclusions,.summary{background:white;border:1px solid var(--line);border-radius:10px}.conclusions{padding:15px 20px}.conclusions ul{margin:0;padding-left:18px}.conclusions li+li{margin-top:5px}.conclusions li::marker{color:var(--accent)}
+.summary{width:100%;border-spacing:0;padding:6px 12px;font-size:13px}.summary th,.summary td{padding:5px 2px;border-bottom:1px solid var(--line)}.summary th{text-align:left;font-weight:500}.summary td{text-align:right;font-variant-numeric:tabular-nums}.summary tr:last-child>*{border:0}
+.panel:fullscreen{border:0;border-radius:0;margin:0}.panel:fullscreen .stage{min-height:0}.rail{overflow:auto}
+@media(max-width:760px){.report{padding:14px 10px}.panel{display:flex;flex-direction:column}.viewport{order:-1}.stage{height:43vh;min-height:280px}.rail{border:0;border-top:1px solid var(--line);display:grid;grid-template-columns:1fr 1fr;align-content:start;gap:4px 18px}.rail h2:first-child{grid-area:1/1}.rail>.controls:first-of-type{grid-area:2/1}.rail h2:nth-of-type(2){grid-area:1/2}.rail>.tools{grid-area:2/2}.filters{grid-column:1/-1}.controls{margin-bottom:6px}.findings{grid-template-columns:1fr}.panel:fullscreen{overflow:auto}.panel:fullscreen .viewport{flex:1}.views button{font-size:11px}}
+</style>
+</head>
+<body>
+<main class="report">
+<h1>@@TITLE@@</h1>
+<p class="meta">场数据 · @@SOURCE@@ · <span id="mesh-info"></span></p>
+@@NOTE@@
+<section class="panel" aria-label="交互三维受力结果">
+<aside class="rail"><h2>视图设置</h2><div class="controls">
+<label>着色 <select id="field"></select></label>
+<label>色标 <select id="range"><option value="p99">截至 P99</option><option value="full">全范围</option><option value="custom">自定义</option></select></label>
+<span id="range-custom" hidden>
+<label>下限 <input id="range-min" type="number" step="any"></label>
+<label>上限 <input id="range-max" type="number" step="any"></label>
+</span>
+<label>形变 <input id="scale" type="number" value="1" min="0" max="10000" step="any" aria-describedby="instructions"> ×</label>
+<button id="animate" type="button" aria-pressed="false">播放形变</button>
+<label>显示 <select id="representation"><option value="surface">表面</option><option value="edges">表面 + 网格</option><option value="wire">线框</option><option value="points">点</option></select></label>
+<label><input id="overlay" type="checkbox"> 原形</label>
+<div class="views" aria-label="视角"><button id="iso" type="button">重置视角</button><button id="end" type="button">沿轴</button><button id="side" type="button">侧视</button><button id="top" type="button">俯视</button></div>
+</div>
+<h2>分析工具</h2><div class="controls tools">
+<label>剖切 <select id="clip"><option value="">关闭</option><option value="0">X</option><option value="1">Y</option><option value="2">Z</option></select></label>
+<input id="clip-position" aria-label="剖切位置" type="range" min="0" max="100" value="50" disabled>
+<button id="flip" type="button" disabled>翻转切面</button>
+<label id="sections-control" hidden>内部截面 <select id="sections"></select></label>
+<button id="peak" type="button">定位峰值</button>
+<button id="measure" type="button" aria-pressed="false">两点测距</button>
+<button id="snapshot" type="button">导出 PNG</button>
+<button id="fullscreen" type="button">全屏</button>
+</div>
+<details class="filters">
+<summary>阈值与等值线</summary>
+<div class="controls">
+<label><input type="checkbox" id="threshold"> 保留 ≥ <input id="threshold-value" type="number" step="any" aria-label="阈值"></label>
+<label><input type="checkbox" id="contour"> 等值线 <input id="contour-value" type="number" step="any" aria-label="等值线值"></label>
+<span id="filter-note" class="meta" aria-live="polite"></span>
+</div>
+</details></aside>
+<div class="viewport"><div id="stage" class="stage" aria-label="3D 模型">
+<div class="view-label" id="view-label">外表面 · 1×</div>
+</div>
+<div class="legend">
+<div class="legend-head"><strong id="legend-title"></strong><span id="range-note"></span></div>
+<div class="ramp" id="ramp"></div><div class="ticks" id="ticks"></div>
+</div>
+<p class="status" id="probe" aria-live="polite">点击模型读取表面场值。</p></div>
+</section>
+<p class="help" id="instructions">拖动旋转，滚轮缩放，右键拖动平移。形变倍率只改变外形，0× 显示原形。颜色和拾取值使用原始场单位。</p>
+<div class="findings"><section class="conclusions" aria-labelledby="conclusion-title">
+<h2 id="conclusion-title">分析结论</h2>
+<ul>@@CONCLUSIONS@@</ul>
+</section>
+@@SUMMARY@@</div>
+</main>
+<script type="application/json" id="result-data">@@DATA@@</script>
+<script>@@VTK@@</script>
+<script>@@VIEWER@@</script>
+<!-- Bundled vtk.js third-party notices
+@@LICENSE@@
+-->
+</body>
+</html>

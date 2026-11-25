@@ -230,6 +230,9 @@ def run_solve(*, geometry: str | None = None, mesh_file: str | None = None, unit
             (grid_def, "von_mises_stress", vm_user),
         ):
             grid[field] = arr
+        grid_orig["stress_tensor"] = sigma * fac["stress"]
+        grid_def["stress_tensor"] = grid_orig["stress_tensor"]
+        grid_def.field_data["geometry_displacement_scale"] = np.array([display_scale])
         # viewer data: surface triangles + fields + BC markers (user units)
         surf_o = grid_orig.extract_surface(algorithm="dataset_surface")
         surf_d = grid_def.extract_surface(algorithm="dataset_surface")
@@ -399,7 +402,61 @@ def main() -> None:
     p.add_argument("--no-benchmarks", action="store_true", help="skip analytical benchmark runs")
     p.add_argument("--convergence", action="store_true",
                    help="run coarse mesh and report delta change (geometry cases)")
+    shell = sub.add_parser("shell", help="solve a planar triangular thin-shell midsurface")
+    shell.add_argument("--mesh", type=Path, required=True, help="triangular midsurface VTP or STL")
+    shell.add_argument("--thickness", type=float, required=True, help="uniform thickness in --units")
+    shell.add_argument("--units", default="m", choices=["m", "mm"])
+    material = shell.add_mutually_exclusive_group()
+    material.add_argument("--material", choices=sorted(MATERIALS))
+    material.add_argument("--young-modulus", type=float, help="Young's modulus in Pa (m) or MPa (mm)")
+    shell.add_argument("--poisson-ratio", type=float, help="Poisson's ratio for --young-modulus")
+    shell.add_argument("--fix", action="append", required=True, help="clamp a boundary edge or VTP point mask")
+    shell.add_argument("--load", action="append", required=True, help="uniform edge force 'EDGE: fx=..,fy=..,fz=..'")
+    shell.add_argument("--scale", type=float, default=1.0, help="display deformation scale")
+    shell.add_argument("--output-dir", type=Path, required=True)
+    shell.add_argument("--name", default="shell")
+    post = sub.add_parser("postprocess", help="write an offline 3D HTML report from solved fields")
+    post.add_argument("--mesh", type=Path, required=True, help="VTP or VTU on the original geometry")
+    post.add_argument("--units", required=True, choices=["m", "mm"], help="units of displacement fields")
+    post.add_argument("--mesh-units", choices=["m", "mm"], help="coordinate units, defaults to --units")
+    post.add_argument("--volume-sections", action="store_true", help="include sampled interior VTU sections")
+    post.add_argument("--summary", type=Path, help="optional solver summary JSON")
+    post.add_argument("--title", default="结构分析 · 3D 后处理")
+    post.add_argument("--conclusion", action="append", help="engineering conclusion, repeatable")
+    post.add_argument("--note", default="", help="report context such as run status or boundary conditions")
+    post.add_argument("--output", type=Path, required=True, help="HTML report destination")
     args = parser.parse_args()
+    if args.cmd == "postprocess":
+        from postprocess_report import write_postprocess_html
+
+        try:
+            write_postprocess_html(args.mesh, args.output, units=args.units,
+                                   mesh_units=args.mesh_units or args.units, title=args.title,
+                                   summary=args.summary, note=args.note, volume_sections=args.volume_sections,
+                                   conclusions=args.conclusion)
+        except (ValueError, OSError) as error:
+            post.error(str(error))
+        print(f"report.html: {args.output}")
+        return
+    if args.cmd == "shell":
+        from assembly import Material
+        from shell import run_shell
+
+        if (args.young_modulus is None) != (args.poisson_ratio is None):
+            shell.error("--young-modulus and --poisson-ratio must be supplied together")
+        mat = MATERIALS[args.material or "steel"] if args.young_modulus is None else Material(
+            "custom", args.young_modulus / _unit_factors(args.units)["stress"], args.poisson_ratio
+        )
+        try:
+            report = run_shell(args.mesh, args.thickness, mat, args.units, args.fix, args.load,
+                               args.output_dir, args.name, args.scale)
+        except (ValueError, OSError) as error:
+            shell.error(str(error))
+        ok = all(g["passed"] for g in report["gates"].values())
+        print(f"decision: {'PASS' if ok else 'FAIL'}")
+        print(f"report.json: {report['outputs']['report_json']}")
+        print(f"deformed vtp: {report['outputs']['deformed_mesh_vtp']}")
+        sys.exit(0 if ok else 1)
     if args.cmd == "solve":
         conv = (args.mesh_size * 2.0, args.mesh_size) if (args.convergence and args.geometry) else None
         report = run_solve(
