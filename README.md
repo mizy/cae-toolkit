@@ -1,23 +1,10 @@
-# CAD Surface Mesher
+# CAE Toolkit
 
-Personal toolkit for CAD-to-watertight-surface meshing, repair planning, tessellation, and fast vehicle geometry analysis.
+Personal engineering toolkit for CAD surface meshing, vehicle and aircraft aerodynamic coefficient prediction, and linear static structural analysis.
 
 All logic lives inside **agent skills** under `.agents/skills/<skill-name>`. Each skill owns its `SKILL.md`, scripts, references, assets, and documentation.
 
-车辆与飞机气动系数的实际训练来源、样本划分和未训练候选，见[训练数据清单](.agents/skills/cad-surface-mesher/docs/aerodynamic-training-datasets.md)。
-
-## Skills
-
-### predict-vehicle-cd
-
-Fast geometry-similarity Cd prediction from vehicle meshes.
-
-```bash
-cd .agents/skills/predict-vehicle-cd
-python scripts/vehicle_cd_similarity.py predict /path/to/car.vtp \
-  --library assets/reference-library/reference_cars.json \
-  --output-dir /tmp/cd_estimate
-```
+## CAD surface meshing
 
 ### mesh-watertight-repair
 
@@ -52,7 +39,30 @@ cd .agents/skills/cad-surface-mesher
 python scripts/audit_surface_mesh.py /path/to/car.vtp --output-dir /tmp/cad-surface-audit
 ```
 
-See each skill's `SKILL.md` for detailed documentation.
+## Aerodynamic coefficient prediction
+
+### predict-vehicle-cd
+
+Fast geometry-similarity Cd prediction from vehicle meshes.
+
+```bash
+cd .agents/skills/predict-vehicle-cd
+python scripts/vehicle_cd_similarity.py predict /path/to/car.vtp \
+  --library assets/reference-library/reference_cars.json \
+  --output-dir /tmp/cd_estimate
+```
+
+### predict-aircraft-coefficients
+
+Train and evaluate aircraft Cd and Cl predictors using five-view geometry and declared flight conditions. See the [aircraft training workflow](.agents/skills/predict-aircraft-coefficients/SKILL.md).
+
+车辆与飞机气动系数的实际训练来源、样本划分和未训练候选，见[训练数据清单](.agents/skills/cad-surface-mesher/docs/aerodynamic-training-datasets.md)。
+
+## Structural analysis
+
+### structural-solver
+
+Linear static analysis of tetrahedral solids and planar thin shells, with deformation and stress reports. See the [solver CLI](.agents/skills/structural-solver/SKILL.md) and the [browser WebGPU workflow](.agents/skills/structural-solver/web/README.md).
 
 ## Dependencies
 
@@ -66,8 +76,10 @@ Optional `trimesh` improves GLB/GLTF loading.
 
 ```text
 .agents/skills/predict-vehicle-cd/          Cd prediction (standalone)
+.agents/skills/predict-aircraft-coefficients/ Aircraft Cd and Cl prediction
 .agents/skills/mesh-watertight-repair/      Mesh → watertight exterior shell
 .agents/skills/surface-tessellation/        CAD/mesh → VTP surface mesh
+.agents/skills/structural-solver/           Linear static FEM and postprocessing
 .agents/skills/cad-surface-mesher/          CAD surface meshing orchestrator
   ├── SKILL.md                              AI agent entrypoint
   ├── scripts/                              Shared scripts (audit, etc.)
